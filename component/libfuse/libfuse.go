@@ -42,6 +42,7 @@ import (
 	"github.com/Azure/azure-storage-fuse/v2/common/config"
 	"github.com/Azure/azure-storage-fuse/v2/common/log"
 	"github.com/Azure/azure-storage-fuse/v2/internal"
+	"github.com/Azure/azure-storage-fuse/v2/internal/handlemap"
 	"github.com/Azure/azure-storage-fuse/v2/internal/stats_manager"
 )
 
@@ -171,6 +172,11 @@ func (lf *Libfuse) Start(ctx context.Context) error {
 	// This marks the global fuse object so shall be the first statement
 	fuseFS = lf
 
+	// Let shutdown Drain also wait for the native C read/write/flush path.
+	handlemap.RegisterDrainCheck(func() bool { return nativeInflight() == 0 })
+	// Let shutdown flush reconcile the native direct-IO dirty byte.
+	registerNativeDirtyCheck()
+
 	if lf.kernelListCacheTtlInSec > 0 {
 		lf.kernelListCacheTracker = newKernelListCacheTracker(lf.kernelListCacheTtlInSec)
 		lf.kernelListCacheTracker.start()
@@ -200,6 +206,24 @@ func (lf *Libfuse) Stop() error {
 	}
 	_ = lf.destroyFuse()
 	libfuseStatsCollector.Destroy()
+	return nil
+}
+
+// FreezeAdmissions closes both the Go and native-C admission gates. The
+// shutdown coordinator discovers this through the pipeline and does not need
+// to import the cgo-bearing libfuse package directly.
+func (lf *Libfuse) FreezeAdmissions() {
+	freezeAdmissions()
+}
+
+// CloseFuseSession terminates the FUSE session so the blocked fuse_main call
+// returns to the pipeline. fuse_session_exit alone does not always wake the
+// blocked /dev/fuse read, so follow it with a self fusermount detach (the
+// same mechanism used by an explicit `blobfuse2 unmount`). Idempotent: when
+// the session is already gone both calls are tolerated.
+func (lf *Libfuse) CloseFuseSession() error {
+	_ = lf.destroyFuse()
+	lf.selfUnmount()
 	return nil
 }
 

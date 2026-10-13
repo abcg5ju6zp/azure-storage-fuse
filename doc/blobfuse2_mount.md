@@ -52,6 +52,52 @@ blobfuse2 mount [path] [flags]
       --disable-version-check   To disable version check that is performed automatically
 ```
 
+### Ordered shutdown and data recovery
+
+On `SIGINT`/`SIGTERM` (including signals forwarded from the daemon parent and
+`blobfuse2 unmount`) blobfuse2 runs an ordered, identity-tagged shutdown. The
+same sequence runs when the parent (daemon) process exits, and a natural FUSE
+exit caused by an external `fusermount -u` / `unmount -z` is handled on the
+same code path, so lazy unmount behaviour is unchanged:
+
+1. reject new mutating FUSE operations,
+2. wait for in-flight operations to reach a safe point,
+3. flush/commit every dirty handle (uploads are bounded by `flush-timeout-sec`);
+   writes that only reached the native direct-IO path are reconciled here,
+4. close the FUSE session,
+5. stop components (each bounded by `component-stop-timeout-sec`),
+6. gracefully stop the health monitor (`monitor-stop-timeout-sec`),
+7. clean only cache content that is not pending recovery.
+
+A second terminal signal escalates to the fast preserve-and-exit path; a
+third terminates immediately. If any write could not be confirmed committed,
+the process exits with code **75 (EX_TEMPFAIL)** instead of reporting success;
+exit code 0 means all writes were confirmed. A forced (second-signal) shutdown
+always reports 75, even when no concrete uncommitted item could be enumerated,
+because in-flight data cannot be proven safe. Files pending recovery are
+protected from cleanup and recorded in a recovery manifest; the next mount
+re-uploads them before serving I/O and accepts a non-empty cache directory
+while a recovery manifest is present (the legacy "temp directory not empty"
+guard is bypassed for that mount). With `recovery-policy: readonly` the next
+mount is served read-only if the residue cannot be recovered; with `recover`
+(default) the mount fails until recovery succeeds.
+
+Files: `$HOME/.blobfuse2/recovery/<mount>-<component>.json` (recovery list,
+0600) and `$HOME/.blobfuse2/<mount>.stop.json` (machine-readable last-shutdown
+report, 0644).
+
+These limits are configurable under the `stop:` section of the config file
+(defaults shown):
+
+```yaml
+stop:
+  op-drain-timeout-sec: 5
+  flush-timeout-sec: 30
+  component-stop-timeout-sec: 10
+  monitor-stop-timeout-sec: 5
+  recovery-policy: recover
+```
+
 ### SEE ALSO
 
 * [blobfuse2](blobfuse2.md)	 - Blobfuse2 is an open source project developed to provide a virtual filesystem backed by the Azure Storage.

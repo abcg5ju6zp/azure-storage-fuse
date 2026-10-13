@@ -70,6 +70,10 @@ type cachePolicy interface {
 
 	IsCached(name string) bool // Whether or not the cache policy considers this file cached
 
+	// SetProtectedCheck installs a predicate under which cached files must
+	// never be evicted (shutdown residue pending recovery). nil clears it.
+	SetProtectedCheck(isProtected func(absPath string) bool)
+
 	Name() string // The name of the policy
 }
 

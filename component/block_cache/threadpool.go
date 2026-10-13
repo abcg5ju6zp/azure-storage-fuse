@@ -69,6 +69,8 @@ type workItem struct {
 	failCnt  int32             // How many times this item has failed to download
 	upload   bool              // Flag marking this is a upload request or not
 	blockId  string            // BlockId of the block
+	info     *blockInfo        // blockList entry this upload stages (worker-only state)
+	size     uint64            // payload length snapshotted at schedule time (worker-only)
 	ETag     string            // Etag of the file before scheduling.
 }
 

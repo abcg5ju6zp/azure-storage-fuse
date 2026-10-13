@@ -2327,11 +2327,12 @@ func (suite *blockCacheTestSuite) TestBlockFailOverwrite() {
 	h.Size = int64(_1MB)
 	lst, _ := h.GetValue("blockList")
 	listMap := lst.(map[int64]*blockInfo)
-	listMap[0] = &blockInfo{
-		id:        "AAAAAAAA",
-		committed: true,
-		size:      _1MB,
+	committedInfo := &blockInfo{
+		id:   "AAAAAAAA",
+		size: _1MB,
 	}
+	committedInfo.committed.Store(true)
+	listMap[0] = committedInfo
 
 	// write at offset 0 where block 0 download will fail
 	n, err := tobj.blockCache.WriteFile(&internal.WriteFileOptions{Handle: h, Offset: 0, Data: dataBuff[:1*_1MB]})

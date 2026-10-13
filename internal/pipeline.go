@@ -37,6 +37,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/Azure/azure-storage-fuse/v2/common"
 	"github.com/Azure/azure-storage-fuse/v2/common/log"
@@ -106,7 +107,20 @@ func NewPipeline(components []string, isParent bool) (*Pipeline, error) {
 	}, nil
 }
 
-// Create : Use the initialized objects to form a pipeline by registering next component to each component
+// NewPipelineWithComponents builds a pipeline from ready-made components.
+// Intended for shutdown orchestration unit tests that inject fakes.
+func NewPipelineWithComponents(components []Component) *Pipeline {
+	p := &Pipeline{components: components}
+	p.Header = components[0]
+	curComp := components[0]
+	for i := 1; i < len(components); i++ {
+		curComp.SetNextComponent(components[i])
+		curComp = components[i]
+	}
+	return p
+}
+
+// Create : Use Initialize objects to form a pipeline by registering next component to each component
 func (p *Pipeline) Create() {
 	p.Header = p.components[0]
 	curComp := p.Header
@@ -158,6 +172,83 @@ func (p *Pipeline) Stop() (err error) {
 	}
 
 	return nil
+}
+
+// Components returns the ordered component list (libfuse first, producer
+// last). The slice is a copy; callers must not mutate the pipeline itself.
+func (p *Pipeline) Components() []Component {
+	out := make([]Component, len(p.components))
+	copy(out, p.components)
+	return out
+}
+
+// Drainers returns components implementing ShutdownDrainer, in pipeline order.
+func (p *Pipeline) Drainers() []ShutdownDrainer {
+	out := make([]ShutdownDrainer, 0, len(p.components))
+	for _, c := range p.components {
+		if d, ok := c.(ShutdownDrainer); ok {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// DeferredCleaners returns components implementing DeferredCacheCleaner.
+func (p *Pipeline) DeferredCleaners() []DeferredCacheCleaner {
+	out := make([]DeferredCacheCleaner, 0, len(p.components))
+	for _, c := range p.components {
+		if d, ok := c.(DeferredCacheCleaner); ok {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// ByName finds a component by Name(), or nil if absent.
+func (p *Pipeline) ByName(name string) Component {
+	for _, c := range p.components {
+		if c.Name() == name {
+			return c
+		}
+	}
+	return nil
+}
+
+// StopWithDeadline stops components in pipeline order but bounds each Stop()
+// call so a stuck component cannot hang shutdown. Timed-out calls leave an
+// abandoned goroutine behind (the process exits right after), but the next
+// component still runs. All errors, including timeouts, are joined.
+func (p *Pipeline) StopWithDeadline(perComponent time.Duration) error {
+	var errs []error
+	for _, comp := range p.components {
+		done := make(chan error, 1)
+		go func(c Component) {
+			defer func() {
+				if r := recover(); r != nil {
+					done <- fmt.Errorf("component %s Stop panic: %v", c.Name(), r)
+				}
+			}()
+			done <- c.Stop()
+		}(comp)
+
+		var err error
+		if perComponent <= 0 {
+			err = <-done
+		} else {
+			timer := time.NewTimer(perComponent)
+			select {
+			case err = <-done:
+				timer.Stop()
+			case <-timer.C:
+				err = fmt.Errorf("component %s Stop timed out after %v", comp.Name(), perComponent)
+			}
+		}
+		if err != nil {
+			log.Err("Pipeline::StopWithDeadline : component %s Stop error: %s", comp.Name(), err.Error())
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // AddComponent : Each component calls this method in their init to register the constructor

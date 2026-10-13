@@ -39,6 +39,7 @@ import (
 	"syscall"
 
 	"github.com/Azure/azure-storage-fuse/v2/common"
+	"go.uber.org/atomic"
 )
 
 // Various flags denoting state of a block
@@ -70,9 +71,13 @@ type Block struct {
 }
 
 type blockInfo struct {
-	id        string // blockID of the block
-	committed bool   // flag to determine if the block has been committed or not
-	size      uint64 // length of data in block
+	id string // blockID of the block
+	// PutBlock succeeded; the server holds this uncommitted block. Set by the
+	// upload worker goroutine and read from the shutdown drainer, so it must
+	// be atomic rather than guarded by the (not-held) handle lock.
+	staged    atomic.Bool
+	committed atomic.Bool // the block has been committed via PutBlockList
+	size      uint64      // length of data in block
 }
 
 // AllocateBlock creates a new memory mapped buffer for the given size

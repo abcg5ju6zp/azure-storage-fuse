@@ -152,21 +152,46 @@ func IsDirectoryEmpty(path string) bool {
 }
 
 func TempCacheCleanup(path string) error {
+	_, err := TempCacheCleanupProtected(path, nil)
+	return err
+}
+
+// CleanupReport summarizes a protected cache cleanup pass.
+type CleanupReport struct {
+	Removed int
+	Skipped int
+}
+
+// TempCacheCleanupProtected removes first-level children of path except those
+// for which isProtected returns true. A nil predicate keeps the historical
+// "remove everything" behavior. Skipped entries are counted so callers can log
+// them; they must include recovery manifest residue and uncommitted cache.
+func TempCacheCleanupProtected(path string, isProtected func(absPath string) bool) (CleanupReport, error) {
+	var report CleanupReport
 	if !IsDirectoryEmpty(path) {
 		// List the first level children of the directory
 		dirents, err := os.ReadDir(path)
 		if err != nil {
 			// Failed to list, return back error
-			return fmt.Errorf("failed to list directory contents : %s", err.Error())
+			return report, fmt.Errorf("failed to list directory contents : %s", err.Error())
 		}
 
-		// Delete all first level children with their hierarchy
+		// Delete first level children with their hierarchy unless protected
 		for _, entry := range dirents {
-			os.RemoveAll(filepath.Join(path, entry.Name()))
+			child := filepath.Join(path, entry.Name())
+			if isProtected != nil && isProtected(child) {
+				report.Skipped++
+				continue
+			}
+			// Errors are ignored on purpose, matching the historical
+			// TempCacheCleanup behavior (best-effort cache wipe).
+			if os.RemoveAll(child) == nil {
+				report.Removed++
+			}
 		}
 	}
 
-	return nil
+	return report, nil
 }
 
 // DirectoryExists is a utility function that returns true if the directory at that path exists and returns false if it does not exist.

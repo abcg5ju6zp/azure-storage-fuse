@@ -39,6 +39,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #include <linux/fs.h>
 #include <sys/types.h>
 #include <errno.h>
@@ -51,6 +52,7 @@
 #include <fuse.h>
 #else
 #include <fuse3/fuse.h>
+#include <fuse3/fuse_lowlevel.h>
 #include "libfuse_compat.h"
 #endif
 
@@ -68,6 +70,64 @@
 #else
 #define LIBFUSE_HAS_CACHE_READDIR 0
 #endif
+
+/*
+ * Shutdown freeze gate shared with the native (pure C) read/write/flush fast
+ * path. These callbacks never enter Go for plain I/O, so the Go-side
+ * handlemap gate is not visible there; an equivalent C11 atomic gate is kept.
+ * Both gates are set together by FreezeAdmissions(). Must be defined before
+ * native_file_io.h, whose callbacks call the enter/leave helpers.
+ */
+static _Atomic int g_fuse_frozen = 0;
+
+/*
+ * Number of native C callbacks currently executing. Reaching zero notifies Go
+ * through blobfuse_native_ops_drained() so its Drain wait can complete. The
+ * Go call happens only on the zero transition, never per I/O.
+ */
+static _Atomic long g_native_inflight = 0;
+
+extern void blobfuse_native_ops_drained(void);
+
+static void set_fuse_gate(int frozen)
+{
+    atomic_store(&g_fuse_frozen, frozen);
+}
+
+static int is_fuse_frozen(void)
+{
+    return atomic_load(&g_fuse_frozen);
+}
+
+static long native_inflight_count(void)
+{
+    return atomic_load(&g_native_inflight);
+}
+
+/*
+ * enter_native_op accounts one native callback. Mutating callbacks are
+ * rejected while the gate is frozen; read/flush callbacks are always admitted
+ * because in-flight reads must finish and flush carries the final upload.
+ * Returns 1 when admitted, 0 for -ESHUTDOWN.
+ */
+static int enter_native_op(int mutate)
+{
+    atomic_fetch_add_explicit(&g_native_inflight, 1, memory_order_relaxed);
+    if (mutate && atomic_load_explicit(&g_fuse_frozen, memory_order_acquire)) {
+        long left = atomic_fetch_sub_explicit(&g_native_inflight, 1, memory_order_release) - 1;
+        if (left == 0)
+            blobfuse_native_ops_drained();
+        return 0;
+    }
+    return 1;
+}
+
+static void leave_native_op(void)
+{
+    long left = atomic_fetch_sub_explicit(&g_native_inflight, 1, memory_order_release) - 1;
+    if (left == 0)
+        blobfuse_native_ops_drained();
+}
 
 #include "libfuse_defs.h"
 #include "native_file_io.h"
@@ -274,6 +334,27 @@ static int invalidate_dir_cache(const char *path) {
     return ret;
 #else
     return -1;
+#endif
+}
+
+/*
+ * stop_fuse asks the running FUSE session to terminate so that fuse_main
+ * returns and the pipeline can proceed with the remaining shutdown phases.
+ * It is idempotent and safe to call from a signal-handling goroutine.
+ */
+static void stop_fuse(void)
+{
+    if (g_fuse == NULL)
+        return;
+
+#ifdef __FUSE2__
+    /* libfuse2 high-level API: fuse_exit signals fuse_loop to exit and the
+       fuse_main wrapper then unmounts and destroys the session. */
+    fuse_exit(g_fuse);
+#else
+    /* libfuse3: mark the session exited; the fuse loop observes the flag and
+       returns, after which fuse_main unmounts and destroys everything. */
+    fuse_session_exit(fuse_get_session(g_fuse));
 #endif
 }
 

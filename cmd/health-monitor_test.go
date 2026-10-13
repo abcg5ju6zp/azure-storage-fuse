@@ -94,8 +94,8 @@ func (suite *hmonTestSuite) SetupTest() {
 
 func (suite *hmonTestSuite) cleanupTest() {
 	resetCLIFlags(*healthMonCmd)
-	resetCLIFlags(*healthMonStop)
-	resetCLIFlags(*healthMonStopAll)
+	resetCLIFlags(*healthMonStopCmd)
+	resetCLIFlags(*healthMonStopAllCmd)
 }
 
 func (suite *hmonTestSuite) TestValidateHmonOptions() {
@@ -131,7 +131,8 @@ func (suite *hmonTestSuite) TestBuildHmonCliParams() {
 		MaxSizeMB: 200,
 	}
 
-	cliParams := buildCliParamForMonitor()
+	pid = "12345"
+	cliParams := BuildMonitorCliParams(pid)
 	suite.assert.Len(cliParams, 11)
 }
 
@@ -170,27 +171,30 @@ func (suite *hmonTestSuite) TestHmonWithConfigFailure() {
 	suite.assert.Contains(op, "failed to start health monitor")
 }
 
-func (suite *hmonTestSuite) TestHmonStopAllFailure() {
+func (suite *hmonTestSuite) TestHmonStopAllNoProcess() {
+	// No bfusemon running: stopping everything is reported as success.
 	op, err := executeCommandC(rootCmd, "health-monitor", "stop", "all")
-	suite.assert.Error(err)
-	suite.assert.Contains(op, "failed to stop all health monitor binaries")
+	suite.assert.NoError(err)
+	suite.assert.Empty(op)
 }
 
 func (suite *hmonTestSuite) TestHmonStopPidEmpty() {
-	op, err := executeCommandC(rootCmd, "health-monitor", "stop", "--pid=")
-	suite.assert.Error(err)
-	suite.assert.Contains(op, "pid of blobfuse2 process not given")
+	// Empty target matches no process and returns success without touching
+	// anything.
+	_, err := executeCommandC(rootCmd, "health-monitor", "stop", "")
+	suite.assert.NoError(err)
 }
 
-func (suite *hmonTestSuite) TestHmonStopPidInvalid() {
-	op, err := executeCommandC(rootCmd, "health-monitor", "stop", fmt.Sprintf("--pid=%s", generateRandomPID()))
-	suite.assert.Error(err)
-	suite.assert.Contains(op, "failed to get health monitor pid")
+func (suite *hmonTestSuite) TestHmonStopPidUnknown() {
+	// A random pid with no matching bfusemon is not an error.
+	_, err := executeCommandC(rootCmd, "health-monitor", "stop", generateRandomPID())
+	suite.assert.NoError(err)
 }
 
-func (suite *hmonTestSuite) TestHmonStopPidFailure() {
-	err := stop(generateRandomPID())
-	suite.assert.Error(err)
+func (suite *hmonTestSuite) TestHmonStopPidAlreadyGone() {
+	// stopMonitorPid tolerates an already-exited process (ESRCH).
+	err := stopMonitorPid(99999999)
+	suite.assert.NoError(err)
 }
 
 func TestHealthMonitorCommand(t *testing.T) {

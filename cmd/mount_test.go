@@ -648,7 +648,7 @@ func (suite *mountTestSuite) TestCleanUpOnStartFlag() {
 		config.Set("cleanup-on-start", "true")
 		config.Set(testComponent+".cleanup-on-start", "false")
 
-		err := options.tempCacheCleanup()
+		err := options.tempCacheCleanup(nil)
 		suite.assert.NoError(err)
 		suite.assert.True(common.IsDirectoryEmpty(cachedirs[i]))
 		// This should not delete the other cache dirs of other components.
@@ -660,7 +660,7 @@ func (suite *mountTestSuite) TestCleanUpOnStartFlag() {
 		config.Set(testComponent+".cleanup-on-start", "true")
 		config.Set("cleanup-on-start", "false")
 
-		err = options.tempCacheCleanup()
+		err = options.tempCacheCleanup(nil)
 		suite.assert.NoError(err)
 		suite.assert.True(common.IsDirectoryEmpty(cachedirs[i]))
 		// This should not delete the other cache dirs of other components.
@@ -671,7 +671,7 @@ func (suite *mountTestSuite) TestCleanUpOnStartFlag() {
 		createFilesInCacheDirs()
 		config.Set(testComponent+".cleanup-on-start", "false")
 		config.Set("cleanup-on-start", "false")
-		err = options.tempCacheCleanup()
+		err = options.tempCacheCleanup(nil)
 		suite.assert.NoError(err)
 		suite.assert.False(common.IsDirectoryEmpty(cachedirs[i]))
 		// This should not delete the other cache dirs of other components.

@@ -54,6 +54,7 @@ import (
 	"github.com/Azure/azure-storage-fuse/v2/common/log"
 	"github.com/Azure/azure-storage-fuse/v2/internal"
 	"github.com/Azure/azure-storage-fuse/v2/internal/handlemap"
+	"github.com/Azure/azure-storage-fuse/v2/internal/recovery"
 	"github.com/vibhansa-msft/tlru"
 )
 
@@ -88,6 +89,21 @@ type BlockCache struct {
 	stream          *Stream
 	lazyWrite       bool           // Flag to indicate if lazy write is enabled
 	fileCloseOpt    sync.WaitGroup // Wait group to wait for all async close operations to complete
+
+	// pendingUncommitted is captured during shutdown DrainForShutdown and
+	// keeps disk eviction/cleanup from deleting staged block files that still
+	// need to be committed on the next mount.
+	pendingMu          sync.Mutex
+	pendingUncommitted []internal.UncommittedItem
+	protectedSet       *recovery.ProtectedSet
+
+	stopOnce  sync.Once
+	stopError error
+
+	cleanupMu       sync.Mutex
+	cleanupDeferred bool
+	cleanupOnce     sync.Once
+	cleanupError    error
 }
 
 // Structure defining your config parameters
@@ -150,6 +166,12 @@ func (bc *BlockCache) Start(ctx context.Context) error {
 		return fmt.Errorf("config error in %s [failed to init thread pool]", bc.Name())
 	}
 
+	// Commit staged blocks left behind by an earlier unclean shutdown before
+	// serving any FUSE I/O (storage is already started in reverse order).
+	if err := bc.recoverOnStartup(); err != nil {
+		return fmt.Errorf("recovery on start failed [%s]", err.Error())
+	}
+
 	// Start the thread pool and keep it ready for download
 	log.Debug("BlockCache::Start : Starting thread pool")
 	bc.threadPool.Start()
@@ -166,26 +188,83 @@ func (bc *BlockCache) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop : Stop the component functionality and kill all threads started
+// Stop : Stop the component functionality and kill all threads started.
+// Idempotent: repeated calls return the first Stop result.
 func (bc *BlockCache) Stop() error {
+	bc.stopOnce.Do(func() {
+		bc.stopError = bc.stopInternal()
+	})
+	return bc.stopError
+}
+
+func (bc *BlockCache) stopInternal() error {
 	log.Trace("BlockCache::Stop : Stopping component %s", bc.Name())
 
-	if bc.lazyWrite {
-		// Wait for all async upload to complete if any
-		log.Info("BlockCache::Stop : Waiting for async close to complete")
-		bc.fileCloseOpt.Wait()
-	}
+	// Bounded wait for lazy-write background stage/commit goroutines.
+	stopCtx, stopCancel := boundedStopContext()
+	bc.waitAsyncCloses(stopCtx)
+	stopCancel()
 
 	// Wait for thread pool to stop
 	bc.threadPool.Stop()
 
-	// Clear the disk cache on exit
-	if bc.tmpPath != "" {
-		_ = bc.diskPolicy.Stop()
-		_ = common.TempCacheCleanup(bc.tmpPath)
+	bc.cleanupMu.Lock()
+	deferred := bc.cleanupDeferred
+	bc.cleanupMu.Unlock()
+	if !deferred {
+		_ = bc.CleanupCache()
 	}
 
+	pending := bc.PendingUncommitted()
+	if len(pending) > 0 {
+		return fmt.Errorf("%s stopped with %d uncommitted block record(s) preserved for recovery",
+			bc.Name(), len(pending))
+	}
 	return nil
+}
+
+// DeferCacheCleanup makes the next Stop skip disk policy shutdown and cache
+// wiping; the coordinator invokes CleanupCache during its cache-cleaning
+// phase (after bfusemon was stopped).
+func (bc *BlockCache) DeferCacheCleanup() {
+	bc.cleanupMu.Lock()
+	bc.cleanupDeferred = true
+	bc.cleanupMu.Unlock()
+}
+
+// CleanupCache stops the disk policy and wipes unprotected cache content.
+// With pending uncommitted records the wholesale tlru shutdown is skipped
+// because it would evict staged block files needed for recovery. Idempotent.
+func (bc *BlockCache) CleanupCache() error {
+	bc.cleanupOnce.Do(func() {
+		bc.cleanupError = bc.cleanupCacheOnce()
+	})
+	return bc.cleanupError
+}
+
+func (bc *BlockCache) cleanupCacheOnce() error {
+	if bc.tmpPath == "" {
+		return nil
+	}
+
+	pending := bc.PendingUncommitted()
+	if len(pending) > 0 {
+		log.Crit("BlockCache::CleanupCache : preserving %d uncommitted block record(s) under %s",
+			len(pending), bc.tmpPath)
+	} else {
+		// Clear the disk cache on exit
+		_ = bc.diskPolicy.Stop()
+	}
+
+	bc.pendingMu.Lock()
+	protected := bc.protectedSet
+	bc.pendingMu.Unlock()
+	var predicate func(string) bool
+	if protected != nil {
+		predicate = protected.IsProtected
+	}
+	_, err := common.TempCacheCleanupProtected(bc.tmpPath, predicate)
+	return err
 }
 
 // GenConfig : Generate the default config for the component
@@ -313,8 +392,15 @@ func (bc *BlockCache) Configure(_ bool) error {
 		}
 
 		if !common.IsDirectoryEmpty(bc.tmpPath) {
-			log.Err("BlockCache: config error %s directory is not empty", bc.tmpPath)
-			return fmt.Errorf("config error in %s [%s]", bc.Name(), "temp directory not empty")
+			// A previous unclean shutdown can deliberately leave staged block
+			// files plus a recovery manifest here. Accept the directory so the
+			// Start recovery step can commit them via PutBlockList.
+			if !recovery.HasManifest(common.DefaultWorkDir, bc.mntPath, compName) {
+				log.Err("BlockCache: config error %s directory is not empty", bc.tmpPath)
+				return fmt.Errorf("config error in %s [%s]", bc.Name(), "temp directory not empty")
+			}
+			log.Crit("BlockCache: %s is non-empty but carries a recovery manifest; "+
+				"allowing startup recovery to consume the residue", bc.tmpPath)
 		}
 
 		bc.diskSize = bc.getDefaultDiskSize(bc.tmpPath)
@@ -457,11 +543,12 @@ func (bc *BlockCache) validateBlockList(handle *handlemap.Handle, options intern
 			log.Err("BlockCache::validateBlockList : Block size mismatch for %s [block: %v, size: %v]", options.Name, block.Id, block.Size)
 			return false
 		}
-		listMap[int64(idx)] = &blockInfo{
-			id:        block.Id,
-			committed: true,
-			size:      block.Size,
+		info := &blockInfo{
+			id:   block.Id,
+			size: block.Size,
 		}
+		info.committed.Store(true)
+		listMap[int64(idx)] = info
 	}
 	return true
 }
@@ -1396,7 +1483,8 @@ func shouldCommitAndDownload(blockID int64, handle *handlemap.Handle) (bool, boo
 		// block id exists
 		// If block is staged, return true for commit and false for downloading
 		// If block is committed, return false for commit and true for downloading
-		return !val.committed, val.committed
+		committed := val.committed.Load()
+		return !committed, committed
 	} else {
 		return false, false
 	}
@@ -1405,13 +1493,17 @@ func shouldCommitAndDownload(blockID int64, handle *handlemap.Handle) (bool, boo
 // lineupUpload : Create a work item and schedule the upload
 func (bc *BlockCache) lineupUpload(handle *handlemap.Handle, block *Block, listMap map[int64]*blockInfo) {
 	id := common.GetBlockID(common.BlockIDLength)
-	listMap[block.id] = &blockInfo{
-		id:        id,
-		committed: false,
-		size:      bc.getBlockSize(uint64(handle.Size), block),
+	// Callers (write/flush paths) hold the handle lock that serializes this
+	// map. The blockInfo pointer is handed straight to the work item so the
+	// upload worker never has to reach into the handle's value map (which is
+	// not safe to read without the handle lock).
+	info := &blockInfo{
+		id:   id,
+		size: bc.getBlockSize(uint64(handle.Size), block),
 	}
+	listMap[block.id] = info
 
-	log.Debug("BlockCache::lineupUpload : block %v, size %v for %v=>%s, blockId %v", block.id, bc.getBlockSize(uint64(handle.Size), block), handle.ID, handle.Path, id)
+	log.Debug("BlockCache::lineupUpload : block %v, size %v for %v=>%s, blockId %v", block.id, info.size, handle.ID, handle.Path, id)
 	item := &workItem{
 		handle:   handle,
 		block:    block,
@@ -1419,6 +1511,8 @@ func (bc *BlockCache) lineupUpload(handle *handlemap.Handle, block *Block, listM
 		failCnt:  0,
 		upload:   true,
 		blockId:  id,
+		info:     info,
+		size:     info.size,
 	}
 
 	block.Uploading()
@@ -1484,7 +1578,7 @@ func (bc *BlockCache) upload(item *workItem) {
 	flock := bc.fileLocks.Get(fileName)
 	flock.Lock()
 	defer flock.Unlock()
-	blockSize := bc.getBlockSize(uint64(item.handle.Size), item.block)
+	blockSize := item.size
 	// This block is updated so we need to stage it now
 	err := bc.NextComponent().StageData(internal.StageDataOptions{
 		Name:   item.handle.Path,
@@ -1551,6 +1645,13 @@ return_safe:
 	item.block.flags.Set(BlockFlagSynced)
 	item.block.NoMoreDirty()
 	item.block.Ready(BlockStatusUploaded)
+	// The block is now staged on the service; record it on the blockList entry
+	// handed to this work item so an interrupted commit can be recovered via
+	// PutBlockList on the next mount. The field is atomic and no handle state
+	// (value map or handle lock) is touched from this worker goroutine.
+	if item.info != nil {
+		item.info.staged.Store(true)
+	}
 }
 
 // Stage the given number of blocks from this handle
@@ -1613,7 +1714,7 @@ func (bc *BlockCache) commitBlocks(handle *handlemap.Handle) error {
 	list, _ := handle.GetValue("blockList")
 	listMap := list.(map[int64]*blockInfo)
 	for k := range listMap {
-		listMap[k].committed = true
+		listMap[k].committed.Store(true)
 	}
 
 	restaged := false
@@ -1726,9 +1827,8 @@ func (bc *BlockCache) getBlockIDList(handle *handlemap.Handle) ([]string, []stri
 
 				blockIDList = append(blockIDList, zeroBlockID)
 				listMap[index] = &blockInfo{
-					id:        zeroBlockID,
-					committed: false,
-					size:      bc.blockPool.blockSize,
+					id:   zeroBlockID,
+					size: bc.blockPool.blockSize,
 				}
 				log.Debug("BlockCache::getBlockIDList : Adding zero block for %v=>%s, index %v", handle.ID, handle.Path, index)
 				log.Debug("BlockCache::getBlockIDList : Preparing blocklist for %v=>%s (%v :  %v, zero block size %v)", handle.ID, handle.Path, index, zeroBlockID, bc.blockPool.blockSize)
@@ -1768,6 +1868,13 @@ func (bc *BlockCache) stageZeroBlock(handle *handlemap.Handle, tryCnt int) (stri
 // diskEvict : Callback when a node from disk expires
 func (bc *BlockCache) diskEvict(node *list.Element) {
 	fileName := node.Value.(string)
+
+	// Staged-but-uncommitted blocks are pending recovery and must stay on
+	// disk until PutBlockList succeeds on the next mount.
+	if bc.isProtectedDiskFile(fileName) {
+		log.Info("BlockCache::diskEvict : File %s protected for recovery, skipping", fileName)
+		return
+	}
 
 	// If this block is already locked then return otherwise Lock() will hung up
 	if bc.fileLocks.Locked(fileName) {

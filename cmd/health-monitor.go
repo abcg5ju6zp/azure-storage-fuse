@@ -97,7 +97,7 @@ var healthMonCmd = &cobra.Command{
 			return fmt.Errorf("invalid health_monitor config [%s]", err.Error())
 		}
 
-		cliParams := buildCliParamForMonitor()
+		cliParams := BuildMonitorCliParams(pid)
 		log.Debug("health-monitor : Options = %v", cliParams)
 		log.Debug("health-monitor : Starting health-monitor for blobfuse2 pid = %s", pid)
 
@@ -137,10 +137,12 @@ func validateHMonOptions() error {
 	return nil
 }
 
-func buildCliParamForMonitor() []string {
+// BuildMonitorCliParams assembles the command line for the external bfusemon
+// process watching the given blobfuse2 pid.
+func BuildMonitorCliParams(monPid string) []string {
 	var cliParams []string
 
-	cliParams = append(cliParams, "--pid="+pid)
+	cliParams = append(cliParams, "--pid="+monPid)
 	if options.MonitorOpt.BfsPollInterval != 0 {
 		cliParams = append(cliParams, fmt.Sprintf("--stats-poll-interval-sec=%v", options.MonitorOpt.BfsPollInterval))
 	}
@@ -168,7 +170,7 @@ func buildCliParamForMonitor() []string {
 		case hmcommon.FileCacheMon:
 			cliParams = append(cliParams, "--no-file-cache-monitor")
 		default:
-			log.Debug("health-monitor::buildCliParamForMonitor: Invalid health monitor option %v", v)
+			log.Debug("health-monitor::BuildMonitorCliParams: Invalid health monitor option %v", v)
 		}
 	}
 

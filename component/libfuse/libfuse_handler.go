@@ -249,10 +249,37 @@ func populateFuseArgs(opts *C.fuse_options_t, args *C.fuse_args_t) (*C.fuse_opti
 	return opts, 0
 }
 
-// destroyFuse is a no-op
+// destroyFuse asks the live FUSE session to terminate so fuse_main returns.
+// The C side is idempotent and NULL-safe; after the destroy callback g_fuse is
+// cleared, so late calls become no-ops.
 func (lf *Libfuse) destroyFuse() error {
-	log.Trace("Libfuse::destroyFuse : Destroying FUSE")
+	log.Trace("Libfuse::destroyFuse : Requesting FUSE session exit")
+	C.stop_fuse()
 	return nil
+}
+
+// freezeNativeGate closes the native (pure C) I/O admission gate.
+func freezeNativeGate() {
+	C.set_fuse_gate(C.int(1))
+}
+
+// nativeInflight returns the number of native C callbacks currently running.
+func nativeInflight() int64 {
+	return int64(C.native_inflight_count())
+}
+
+// registerNativeDirtyCheck lets the pure-Go handlemap reconcile direct-IO
+// handles: their dirty state lives in the C file_handle_t byte until
+// flush/release.
+func registerNativeDirtyCheck() {
+	handlemap.RegisterNativeDirtyCheck(func(fh uintptr) bool {
+		return C.blobfuse_native_fh_dirty(C.uint64_t(fh)) != 0
+	})
+}
+
+//export blobfuse_native_ops_drained
+func blobfuse_native_ops_drained() {
+	handlemap.NotifyExternalDrained()
 }
 
 //export libfuse_init
@@ -440,6 +467,11 @@ func (lf *Libfuse) fillStat(attr *internal.ObjAttr, stbuf *C.stat_t) {
 //
 //export libfuse_getattr
 func libfuse_getattr(path *C.char, stbuf *C.stat_t, fi *C.fuse_file_info_t) C.int {
+	if !enterFuseOp(opGetAttr) {
+		return -C.ESHUTDOWN
+	}
+	defer handlemap.LeaveOp()
+
 	name := trimFusePath(path)
 	name = common.NormalizeObjectName(name)
 	// log.Trace("Libfuse::libfuse_getattr : %s", name)
@@ -482,6 +514,11 @@ func libfuse_getattr(path *C.char, stbuf *C.stat_t, fi *C.fuse_file_info_t) C.in
 //
 //export libfuse_mkdir
 func libfuse_mkdir(path *C.char, mode C.mode_t) C.int {
+	if !enterFuseOp(opMkDir) {
+		return -C.ESHUTDOWN
+	}
+	defer handlemap.LeaveOp()
+
 	name := trimFusePath(path)
 	name = common.NormalizeObjectName(name)
 	log.Trace("Libfuse::libfuse_mkdir : %s", name)
@@ -510,6 +547,11 @@ func libfuse_mkdir(path *C.char, mode C.mode_t) C.int {
 //
 //export libfuse_opendir
 func libfuse_opendir(path *C.char, fi *C.fuse_file_info_t) C.int {
+	if !enterFuseOp(opOpenDir) {
+		return -C.ESHUTDOWN
+	}
+	defer handlemap.LeaveOp()
+
 	name := trimFusePath(path)
 	name = common.NormalizeObjectName(name)
 	if name != "" {
@@ -560,6 +602,11 @@ func libfuse_opendir(path *C.char, fi *C.fuse_file_info_t) C.int {
 //
 //export libfuse_releasedir
 func libfuse_releasedir(path *C.char, fi *C.fuse_file_info_t) C.int {
+	if !enterFuseOp(opReleaseDir) {
+		return -C.ESHUTDOWN
+	}
+	defer handlemap.LeaveOp()
+
 	handle := (*handlemap.Handle)(unsafe.Pointer(uintptr(fi.fh)))
 
 	log.Trace("Libfuse::libfuse_releasedir : %s, handle: %d", handle.Path, handle.ID)
@@ -573,6 +620,11 @@ func libfuse_releasedir(path *C.char, fi *C.fuse_file_info_t) C.int {
 //
 //export libfuse_readdir
 func libfuse_readdir(_ *C.char, buf unsafe.Pointer, filler C.fuse_fill_dir_t, off C.off_t, fi *C.fuse_file_info_t, flag C.fuse_readdir_flags_t) C.int {
+	if !enterFuseOp(opReadDir) {
+		return -C.ESHUTDOWN
+	}
+	defer handlemap.LeaveOp()
+
 	handle := (*handlemap.Handle)(unsafe.Pointer(uintptr(fi.fh)))
 
 	handle.RLock()
@@ -647,6 +699,11 @@ func libfuse_readdir(_ *C.char, buf unsafe.Pointer, filler C.fuse_fill_dir_t, of
 //
 //export libfuse_rmdir
 func libfuse_rmdir(path *C.char) C.int {
+	if !enterFuseOp(opRmDir) {
+		return -C.ESHUTDOWN
+	}
+	defer handlemap.LeaveOp()
+
 	name := trimFusePath(path)
 	name = common.NormalizeObjectName(name)
 	log.Trace("Libfuse::libfuse_rmdir : %s", name)
@@ -682,6 +739,11 @@ func libfuse_rmdir(path *C.char) C.int {
 //
 //export libfuse_statfs
 func libfuse_statfs(path *C.char, buf *C.statvfs_t) C.int {
+	if !enterFuseOp(opStatFs) {
+		return -C.ESHUTDOWN
+	}
+	defer handlemap.LeaveOp()
+
 	name := trimFusePath(path)
 	name = common.NormalizeObjectName(name)
 	log.Trace("Libfuse::libfuse_statfs : %s", name)
@@ -714,6 +776,11 @@ func libfuse_statfs(path *C.char, buf *C.statvfs_t) C.int {
 //
 //export libfuse_create
 func libfuse_create(path *C.char, mode C.mode_t, fi *C.fuse_file_info_t) C.int {
+	if !enterFuseOp(opCreate) {
+		return -C.ESHUTDOWN
+	}
+	defer handlemap.LeaveOp()
+
 	name := trimFusePath(path)
 	name = common.NormalizeObjectName(name)
 	log.Trace("Libfuse::libfuse_create : %s", name)
@@ -740,6 +807,7 @@ func libfuse_create(path *C.char, mode C.mode_t, fi *C.fuse_file_info_t) C.int {
 
 	log.Trace("Libfuse::libfuse_create : %s, handle %d", name, handle.ID)
 	fi.fh = C.uint64_t(uintptr(unsafe.Pointer(ret_val)))
+	handle.SetNativeFH(uintptr(unsafe.Pointer(ret_val)))
 
 	libfuseStatsCollector.PushEvents(createFile, name, map[string]any{md: fs.FileMode(uint32(mode) & 0xffffffff)})
 	libfuseStatsCollector.UpdateStats(stats_manager.Increment, createFile, (int64)(1))
@@ -754,6 +822,11 @@ func libfuse_create(path *C.char, mode C.mode_t, fi *C.fuse_file_info_t) C.int {
 //
 //export libfuse_open
 func libfuse_open(path *C.char, fi *C.fuse_file_info_t) C.int {
+	if !enterFuseOpen(uint32(fi.flags)) {
+		return -C.ESHUTDOWN
+	}
+	defer handlemap.LeaveOp()
+
 	name := trimFusePath(path)
 	name = common.NormalizeObjectName(name)
 	log.Trace("Libfuse::libfuse_open : %s", name)
@@ -811,6 +884,7 @@ func libfuse_open(path *C.char, fi *C.fuse_file_info_t) C.int {
 	}
 	log.Trace("Libfuse::libfuse_open : %s, handle %d", name, handle.ID)
 	fi.fh = C.uint64_t(uintptr(unsafe.Pointer(ret_val)))
+	handle.SetNativeFH(uintptr(unsafe.Pointer(ret_val)))
 
 	// increment open file handles count
 	libfuseStatsCollector.UpdateStats(stats_manager.Increment, openHandles, (int64)(1))
@@ -923,6 +997,11 @@ func libfuse_flush(path *C.char, fi *C.fuse_file_info_t) C.int {
 //
 //export libfuse_release
 func libfuse_release(path *C.char, fi *C.fuse_file_info_t) C.int {
+	if !enterFuseOp(opRelease) {
+		return -C.ESHUTDOWN
+	}
+	defer handlemap.LeaveOp()
+
 	fileHandle := (*C.file_handle_t)(unsafe.Pointer(uintptr(fi.fh)))
 	handle := (*handlemap.Handle)(unsafe.Pointer(uintptr(fileHandle.obj)))
 
@@ -947,6 +1026,7 @@ func libfuse_release(path *C.char, fi *C.fuse_file_info_t) C.int {
 	}
 
 	handlemap.Delete(handle.ID)
+	handle.SetNativeFH(0)
 	C.release_native_file_object(fi)
 
 	// decrement open file handles count
@@ -959,6 +1039,11 @@ func libfuse_release(path *C.char, fi *C.fuse_file_info_t) C.int {
 //
 //export libfuse_fsync
 func libfuse_fsync(path *C.char, datasync C.int, fi *C.fuse_file_info_t) C.int {
+	if !enterFuseOp(opFSync) {
+		return -C.ESHUTDOWN
+	}
+	defer handlemap.LeaveOp()
+
 	if fi.fh == 0 {
 		return C.int(-C.EIO)
 	}
@@ -993,6 +1078,11 @@ func libfuse_fsync(path *C.char, datasync C.int, fi *C.fuse_file_info_t) C.int {
 //
 //export libfuse_truncate
 func libfuse_truncate(path *C.char, off C.off_t, fi *C.fuse_file_info_t) C.int {
+	if !enterFuseOp(opTruncate) {
+		return -C.ESHUTDOWN
+	}
+	defer handlemap.LeaveOp()
+
 	name := trimFusePath(path)
 	name = common.NormalizeObjectName(name)
 
@@ -1032,6 +1122,11 @@ func libfuse_truncate(path *C.char, off C.off_t, fi *C.fuse_file_info_t) C.int {
 //
 //export libfuse_unlink
 func libfuse_unlink(path *C.char) C.int {
+	if !enterFuseOp(opUnlink) {
+		return -C.ESHUTDOWN
+	}
+	defer handlemap.LeaveOp()
+
 	name := trimFusePath(path)
 	name = common.NormalizeObjectName(name)
 	log.Trace("Libfuse::libfuse_unlink : %s", name)
@@ -1060,6 +1155,11 @@ func libfuse_unlink(path *C.char) C.int {
 //
 //export libfuse_rename
 func libfuse_rename(src *C.char, dst *C.char, flags C.uint) C.int {
+	if !enterFuseOp(opRename) {
+		return -C.ESHUTDOWN
+	}
+	defer handlemap.LeaveOp()
+
 	srcPath := trimFusePath(src)
 	srcPath = common.NormalizeObjectName(srcPath)
 	dstPath := trimFusePath(dst)
@@ -1160,6 +1260,11 @@ func libfuse_rename(src *C.char, dst *C.char, flags C.uint) C.int {
 //
 //export libfuse_symlink
 func libfuse_symlink(target *C.char, link *C.char) C.int {
+	if !enterFuseOp(opSymLink) {
+		return -C.ESHUTDOWN
+	}
+	defer handlemap.LeaveOp()
+
 	name := trimFusePath(link)
 	name = common.NormalizeObjectName(name)
 	targetPath := C.GoString(target)
@@ -1182,6 +1287,11 @@ func libfuse_symlink(target *C.char, link *C.char) C.int {
 //
 //export libfuse_readlink
 func libfuse_readlink(path *C.char, buf *C.char, size C.size_t) C.int {
+	if !enterFuseOp(opReadLink) {
+		return -C.ESHUTDOWN
+	}
+	defer handlemap.LeaveOp()
+
 	name := trimFusePath(path)
 	name = common.NormalizeObjectName(name)
 	//log.Trace("Libfuse::libfuse_readlink : Received for %s", name)
@@ -1239,6 +1349,11 @@ func libfuse_readlink(path *C.char, buf *C.char, size C.size_t) C.int {
 //
 //export libfuse_fsyncdir
 func libfuse_fsyncdir(path *C.char, datasync C.int, fi *C.fuse_file_info_t) C.int {
+	if !enterFuseOp(opFSyncDir) {
+		return -C.ESHUTDOWN
+	}
+	defer handlemap.LeaveOp()
+
 	name := trimFusePath(path)
 	name = common.NormalizeObjectName(name)
 	log.Trace("Libfuse::libfuse_fsyncdir : %s", name)
@@ -1263,6 +1378,11 @@ func libfuse_fsyncdir(path *C.char, datasync C.int, fi *C.fuse_file_info_t) C.in
 //
 //export libfuse_chmod
 func libfuse_chmod(path *C.char, mode C.mode_t, fi *C.fuse_file_info_t) C.int {
+	if !enterFuseOp(opChmod) {
+		return -C.ESHUTDOWN
+	}
+	defer handlemap.LeaveOp()
+
 	name := trimFusePath(path)
 	name = common.NormalizeObjectName(name)
 	log.Trace("Libfuse::libfuse_chmod : %s", name)
@@ -1292,6 +1412,11 @@ func libfuse_chmod(path *C.char, mode C.mode_t, fi *C.fuse_file_info_t) C.int {
 //
 //export libfuse_chown
 func libfuse_chown(path *C.char, uid C.uid_t, gid C.gid_t, fi *C.fuse_file_info_t) C.int {
+	if !enterFuseOp(opChown) {
+		return -C.ESHUTDOWN
+	}
+	defer handlemap.LeaveOp()
+
 	name := trimFusePath(path)
 	name = common.NormalizeObjectName(name)
 	log.Trace("Libfuse::libfuse_chown : %s", name)
@@ -1303,6 +1428,11 @@ func libfuse_chown(path *C.char, uid C.uid_t, gid C.gid_t, fi *C.fuse_file_info_
 //
 //export libfuse_utimens
 func libfuse_utimens(path *C.char, tv *C.timespec_t, fi *C.fuse_file_info_t) C.int {
+	if !enterFuseOp(opUTimens) {
+		return -C.ESHUTDOWN
+	}
+	defer handlemap.LeaveOp()
+
 	name := trimFusePath(path)
 	name = common.NormalizeObjectName(name)
 	log.Trace("Libfuse::libfuse_utimens : %s", name)

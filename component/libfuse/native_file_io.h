@@ -72,6 +72,19 @@ static void release_native_file_object(fuse_file_info_t* fi)
     }
 }
 
+// blobfuse_native_fh_dirty : Report the dirty byte of a native file handle.
+// Direct-IO (cached) writes run entirely in C and only mark this byte; the Go
+// handlemap.Handle dirty flag is not promoted until flush/release. Shutdown
+// draining calls this through cgo after the in-flight drain so an open handle
+// with unflushed direct writes cannot be mistaken for clean. A zero handle is
+// reported clean.
+static int blobfuse_native_fh_dirty(uint64_t fh)
+{
+    if (fh == 0)
+        return 0;
+    return ((file_handle_t*)fh)->dirty ? 1 : 0;
+}
+
 
 // native_pread :  Do pread on file directly without involving any Go code
 static int native_pread(char *path, char *buf, size_t size, off_t offset, file_handle_t* handle_obj)
@@ -121,11 +134,20 @@ static int native_read_file(char *path, char *buf, size_t size, off_t offset, fu
     return libfuse_read(path, buf, size, offset, fi);
     #endif
 
+    // Reads are never rejected by the shutdown freeze gate, but they are
+    // counted so Drain waits for an in-flight read to reach a safe point.
+    if (!enter_native_op(0))
+        return -ESHUTDOWN;
+
+    int res;
     if (handle_obj->fd == 0) {
-        return libfuse_read(path, buf, size, offset, fi);
+        res = libfuse_read(path, buf, size, offset, fi);
+    } else {
+        res = native_pread(path, buf, size, offset, handle_obj);
     }
 
-    return native_pread(path, buf, size, offset, handle_obj);
+    leave_native_op();
+    return res;
 }
 
 // native_write_file : Write callback to decide whether to natively write or punt call to Go code
@@ -136,23 +158,38 @@ static int native_write_file(char *path, char *buf, size_t size, off_t offset, f
     return libfuse_write(path, buf, size, offset, fi);
     #endif
 
+    // No new dirty data may be produced after the freeze gate closed.
+    if (!enter_native_op(1))
+        return -ESHUTDOWN;
+
+    int res;
     if (handle_obj->fd == 0) {
-        return libfuse_write(path, buf, size, offset, fi);
+        res = libfuse_write(path, buf, size, offset, fi);
+    } else {
+        res = native_pwrite(path, buf, size, offset, handle_obj);
     }
-    
-    return native_pwrite(path, buf, size, offset, handle_obj);
+
+    leave_native_op();
+    return res;
 }
 
 // native_flush_file : Flush the file natively and call flush up in the pipeline to upload this file
 static int native_flush_file(char *path, fuse_file_info_t *fi)
 {
     file_handle_t* handle_obj = (file_handle_t*)fi->fh;
+
+    // flush is the shutdown drain path itself, so it is never rejected; it is
+    // counted like every other in-flight operation.
+    if (!enter_native_op(0))
+        return -ESHUTDOWN;
+
     int ret = libfuse_flush(path, fi);
     if (ret == 0) {
         // As file is flushed and uploaded, reset the dirty bit here
         handle_obj->dirty = 0;
     }
 
+    leave_native_op();
     return ret;
 }
 

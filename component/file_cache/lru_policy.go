@@ -85,6 +85,26 @@ type lruPolicy struct {
 
 	// DU utility was found on the path or not
 	duPresent bool
+
+	// protectedCheck, when set, forbids deleteItem from removing files that
+	// are pending recovery after an unclean shutdown.
+	protectedLock    sync.RWMutex
+	protectedCheckFn func(absPath string) bool
+}
+
+// SetProtectedCheck installs (or clears with nil) the shutdown protection
+// predicate consulted by deleteItem.
+func (p *lruPolicy) SetProtectedCheck(isProtected func(absPath string) bool) {
+	p.protectedLock.Lock()
+	p.protectedCheckFn = isProtected
+	p.protectedLock.Unlock()
+}
+
+func (p *lruPolicy) isProtected(name string) bool {
+	p.protectedLock.RLock()
+	fn := p.protectedCheckFn
+	p.protectedLock.RUnlock()
+	return fn != nil && fn(name)
 }
 
 const (
@@ -500,6 +520,13 @@ func (p *lruPolicy) deleteItem(name string) bool {
 
 	if azPath[0] == '/' {
 		azPath = azPath[1:]
+	}
+
+	// Shutdown residue pending recovery is never evicted.
+	if p.isProtected(name) {
+		log.Warn("lruPolicy::DeleteItem : File protected for recovery, skipping %s", name)
+		p.CacheValid(name)
+		return true
 	}
 
 	flock := p.fileLocks.Get(azPath)

@@ -51,6 +51,7 @@ import (
 	"github.com/Azure/azure-storage-fuse/v2/common/log"
 	"github.com/Azure/azure-storage-fuse/v2/internal"
 	"github.com/Azure/azure-storage-fuse/v2/internal/handlemap"
+	"github.com/Azure/azure-storage-fuse/v2/internal/recovery"
 	"github.com/Azure/azure-storage-fuse/v2/internal/stats_manager"
 
 	"github.com/spf13/cobra"
@@ -84,6 +85,19 @@ type FileCache struct {
 
 	lazyWrite    bool
 	fileCloseOpt sync.WaitGroup
+
+	// pendingUncommitted is captured during shutdown DrainForShutdown and
+	// keeps TempCacheCleanup from deleting data that must be recovered.
+	pendingMu          sync.Mutex
+	pendingUncommitted []internal.UncommittedItem
+
+	stopOnce  sync.Once
+	stopError error
+
+	cleanupMu       sync.Mutex
+	cleanupDeferred bool
+	cleanupOnce     sync.Once
+	cleanupError    error
 }
 
 // Structure defining your config parameters
@@ -162,28 +176,81 @@ func (fc *FileCache) Start(ctx context.Context) error {
 		return fmt.Errorf("config error in %s error [fail to start policy]", fc.Name())
 	}
 
+	// Re-upload data preserved from an earlier unclean shutdown before
+	// serving any FUSE I/O (azstorage is already started in reverse order).
+	if err := fc.recoverOnStartup(); err != nil {
+		return fmt.Errorf("recovery on start failed [%s]", err.Error())
+	}
+
 	// create stats collector for file cache
 	fileCacheStatsCollector = stats_manager.NewStatsCollector(fc.Name())
 
 	return nil
 }
 
-// Stop : Stop the component functionality and kill all threads started
+// Stop : Stop the component functionality and kill all threads started.
+// Idempotent: repeated calls return the first Stop result without
+// re-entering policy shutdown or cache cleanup.
 func (fc *FileCache) Stop() error {
+	fc.stopOnce.Do(func() {
+		fc.stopError = fc.stopInternal()
+	})
+	return fc.stopError
+}
+
+func (fc *FileCache) stopInternal() error {
 	log.Trace("Stopping component : %s", fc.Name())
 
-	// Wait for all async upload to complete if any
-	if fc.lazyWrite {
-		log.Info("FileCache::Stop : Waiting for async close to complete")
-		fc.fileCloseOpt.Wait()
-	}
+	// Bounded wait for lazy-write background uploads. DrainForShutdown usually
+	// already covered this; the timeout keeps a stuck upload from hanging Stop.
+	stopCtx, stopCancel := boundedStopContext()
+	fc.waitAsyncCloses(stopCtx)
+	stopCancel()
 
 	_ = fc.policy.ShutdownPolicy()
-	_ = common.TempCacheCleanup(fc.tmpPath)
+
+	fc.cleanupMu.Lock()
+	deferred := fc.cleanupDeferred
+	fc.cleanupMu.Unlock()
+	if !deferred {
+		_ = fc.CleanupCache()
+	}
 
 	fileCacheStatsCollector.Destroy()
 
+	pending := fc.PendingUncommitted()
+	if len(pending) > 0 {
+		return fmt.Errorf("%s stopped with %d uncommitted file(s) preserved for recovery", fc.Name(), len(pending))
+	}
 	return nil
+}
+
+// DeferCacheCleanup makes the next Stop skip cache wiping; the coordinator
+// runs CleanupCache later in its dedicated cache-cleaning phase.
+func (fc *FileCache) DeferCacheCleanup() {
+	fc.cleanupMu.Lock()
+	fc.cleanupDeferred = true
+	fc.cleanupMu.Unlock()
+}
+
+// CleanupCache wipes only cache content that is not protected (this shutdown's
+// uncommitted files or an earlier recovery manifest). Idempotent.
+func (fc *FileCache) CleanupCache() error {
+	fc.cleanupOnce.Do(func() {
+		fc.cleanupError = fc.cleanupCacheOnce()
+	})
+	return fc.cleanupError
+}
+
+func (fc *FileCache) cleanupCacheOnce() error {
+	pending := fc.PendingUncommitted()
+	protected := fc.buildProtectedSet(pending)
+	report, err := common.TempCacheCleanupProtected(fc.tmpPath, protected.IsProtected)
+	if protected.Len() > 0 {
+		log.Crit("FileCache::CleanupCache : preserving %d protected path(s) under %s (removed %d, skipped %d entries)",
+			protected.Len(), fc.tmpPath, report.Removed, report.Skipped)
+	}
+	return err
 }
 
 // GenConfig : Generate default config for the component
@@ -304,8 +371,18 @@ func (fc *FileCache) Configure(_ bool) error {
 	}
 
 	if !isLocalDirEmpty(fc.tmpPath) && !fc.allowNonEmpty {
-		log.Err("FileCache: config error %s directory is not empty", fc.tmpPath)
-		return fmt.Errorf("config error in %s [%s]", fc.Name(), "temp directory not empty")
+		// A previous unclean shutdown can deliberately leave uncommitted
+		// cache files plus a recovery manifest here. Accept the directory so
+		// Start's recovery step can re-upload them; a corrupt or stale manifest
+		// without matching data is still failed by that recovery step.
+		if recovery.HasManifest(common.DefaultWorkDir, fc.mountPath, compName) {
+			log.Crit("FileCache: %s is non-empty but carries a recovery manifest; "+
+				"allowing startup recovery to consume the residue", fc.tmpPath)
+			fc.allowNonEmpty = true
+		} else {
+			log.Err("FileCache: config error %s directory is not empty", fc.tmpPath)
+			return fmt.Errorf("config error in %s [%s]", fc.Name(), "temp directory not empty")
+		}
 	}
 
 	err = config.UnmarshalKey("allow-other", &fc.allowOther)

@@ -37,7 +37,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Azure/azure-storage-fuse/v2/common"
@@ -155,6 +157,20 @@ func main() {
 		hmcommon.ProcMonInterval, hmcommon.TempCachePath, hmcommon.MaxCacheSize, hmcommon.OutputPath)
 
 	comps := getMonitors()
+
+	// Graceful termination: flush the JSON output before exit instead of
+	// being killed without closing monitor_<pid>.json (kill -9 still applies
+	// if the bounded graceful stop from the mount process expires).
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		log.Info("main::main : received %v, flushing exporter and exiting", sig)
+		if err := hminternal.CloseExporter(); err != nil {
+			log.Err("main::main : Unable to close exporter [%v]", err)
+		}
+		os.Exit(0)
+	}()
 
 	for _, obj := range comps {
 		go obj.Monitor() // nolint

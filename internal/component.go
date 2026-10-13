@@ -36,6 +36,7 @@ package internal
 import (
 	"context"
 	"syscall"
+	"time"
 
 	"github.com/Azure/azure-storage-fuse/v2/common"
 	"github.com/Azure/azure-storage-fuse/v2/internal/handlemap"
@@ -150,4 +151,61 @@ type Component interface {
 	GetCommittedBlockList(string) (*CommittedBlockList, error)
 	StageData(StageDataOptions) error
 	CommitData(CommitDataOptions) error
+}
+
+// Why local data was left uncommitted at shutdown. Values are part of the
+// recovery manifest and the stop status file and must stay stable.
+const (
+	// UncommittedUploadFailed : the upload/commit attempt returned an error.
+	UncommittedUploadFailed = "upload-failed"
+	// UncommittedFlushTimeout : the bounded flush phase expired before completion.
+	UncommittedFlushTimeout = "flush-timeout"
+	// UncommittedForcedSignal : a second terminal signal skipped the upload.
+	UncommittedForcedSignal = "forced-signal"
+	// UncommittedStageOnly : blocks were staged (PutBlock) but never committed
+	// (PutBlockList); they can be recovered while the server keeps them.
+	UncommittedStageOnly = "stage-only"
+	// UncommittedInMemoryLost : dirty data existed only in memory and could
+	// neither be flushed nor preserved; recovery is impossible.
+	UncommittedInMemoryLost = "in-memory-lost"
+)
+
+// UncommittedItem describes one piece of local data that was not confirmed
+// committed when the component shut down. The local path (when set) is
+// protected from cache cleanup and recorded in the recovery manifest.
+type UncommittedItem struct {
+	Component string    `json:"component"`
+	Name      string    `json:"name"`
+	LocalPath string    `json:"local-path,omitempty"`
+	Size      int64     `json:"size,omitempty"`
+	ModTime   time.Time `json:"mod-time,omitempty"`
+	Reason    string    `json:"reason"`
+	// BlockIDs carries staged but uncommitted block IDs for block_cache items.
+	BlockIDs []string `json:"block-ids,omitempty"`
+	// Offset orders blocks of the same blob on recovery (byte offset).
+	Offset int64 `json:"offset,omitempty"`
+}
+
+// CacheRootProvider exposes a cache component's local cache directory so the
+// shutdown runtime can record it in recovery manifests.
+type CacheRootProvider interface {
+	CacheRoot() string
+}
+
+// ShutdownDrainer is an optional component capability. The shutdown
+// coordinator invokes DrainForShutdown during the flushing phase, after new
+// mutations were rejected and in-flight operations drained. Implementations
+// must bound every wait by ctx and return the local data that could not be
+// confirmed committed instead of deleting it.
+type ShutdownDrainer interface {
+	DrainForShutdown(ctx context.Context) ([]UncommittedItem, error)
+}
+
+// DeferredCacheCleaner splits cache wiping out of Stop so the coordinator can
+// run it in the dedicated cache-cleaning phase, after the monitor process was
+// stopped. DeferCacheCleanup makes the following Stop skip the wipe;
+// CleanupCache performs the (protection-aware) wipe exactly once.
+type DeferredCacheCleaner interface {
+	DeferCacheCleanup()
+	CleanupCache() error
 }

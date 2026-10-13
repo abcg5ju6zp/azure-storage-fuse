@@ -34,7 +34,6 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -56,6 +55,8 @@ import (
 	"github.com/Azure/azure-storage-fuse/v2/common/config"
 	"github.com/Azure/azure-storage-fuse/v2/common/log"
 	"github.com/Azure/azure-storage-fuse/v2/internal"
+	"github.com/Azure/azure-storage-fuse/v2/internal/recovery"
+	"github.com/Azure/azure-storage-fuse/v2/internal/shutdown"
 
 	"github.com/sevlyar/go-daemon"
 	"github.com/spf13/cobra"
@@ -500,12 +501,20 @@ var mountCmd = &cobra.Command{
 			}
 		}
 
+		// Uncommitted data from an earlier shutdown must survive a startup
+		// cleanup: build the protected set before any wipe is attempted.
+		recoveryProtected := protectedSetFromManifests(options.Components, options.MountPath)
+
 		// Clean up any cache directory if cleanup-on-start is set from the cli parameter or specified in parameter in
 		// config file for a specific component for file-cache, block-cache, xload.
-		err = options.tempCacheCleanup()
+		err = options.tempCacheCleanup(recoveryProtected)
 		if err != nil {
 			return err
 		}
+
+		// Recovery-policy=readonly forces a read-only mount when residue exists.
+		// Applied after the cleanup but before components are configured.
+		applyRecoveryReadonly(options.Components, options.MountPath)
 
 		common.ForegroundMount = options.Foreground
 
@@ -533,20 +542,22 @@ var mountCmd = &cobra.Command{
 				LogFileName: traceFilePath, // this will redirect stderr of child to given file
 			}
 
-			ctx, _ := context.WithCancel(context.Background()) //nolint
+			ctx, cancelCtx := context.WithCancel(context.Background())
+			defer cancelCtx()
 
-			// Signal handlers for parent and child to communicate success or failures in mount
-			var sigusr2 chan os.Signal
-			if !daemon.WasReborn() { // execute in parent only
-				sigusr2 = make(chan os.Signal, 1)
-				signal.Notify(sigusr2, syscall.SIGUSR2)
+			// Terminal signals observed by the daemon child's shutdown handler.
+			childSigCh := make(chan os.Signal, 8)
 
-			} else { // execute in child only
-				daemon.SetSigHandler(sigusrHandler(pipeline, ctx), syscall.SIGUSR1, syscall.SIGUSR2)
-				go func() {
-					_ = daemon.ServeSignals()
-				}()
-			}
+			// Registered before Reborn so the daemon child inherits the
+			// handlers. USR1 keeps hot config reload, USR2 stays log-only;
+			// SIGINT/SIGTERM/SIGQUIT drive the ordered shutdown instead of
+			// go-daemon's default handler that used to swallow SIGTERM.
+			daemon.SetSigHandler(daemonChildSignalHandler(childSigCh),
+				syscall.SIGUSR1, syscall.SIGUSR2,
+				syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+			go func() {
+				_ = daemon.ServeSignals()
+			}()
 
 		retry:
 			// If the .pid file is locked and there no blobfuse process owning it then we need to try
@@ -563,71 +574,77 @@ var mountCmd = &cobra.Command{
 			}
 
 			log.Debug("mount: foreground disabled, child = %v", daemon.WasReborn())
-			if child == nil { // execute in child only
-
-				// defer the removal of this temp file. This file should only be removed when the mountpoint is
-				// gracefully unmounted. In case of any panic caused by go runtime/ by our application. This file
-				// would have the essential stack trace to debug the issue.
+			if child == nil { // execute in daemon child only
+				// The child's trace file is named after the parent pid and
+				// stderr is linked to it. Remove it only on a clean exit.
 				ppid := os.Getppid()
-				traceFile = fmt.Sprintf("%s.%d.trace", strings.ReplaceAll(options.MountPath, "/", "_"), ppid)
-				// we link this file to stderr of child process in daemon mode
-				traceFilePath = filepath.Join(os.ExpandEnv(common.DefaultWorkDir), traceFile)
+				childTraceFile := fmt.Sprintf("%s.%d.trace", strings.ReplaceAll(options.MountPath, "/", "_"), ppid)
+				childTracePath := filepath.Join(os.ExpandEnv(common.DefaultWorkDir), childTraceFile)
 
-				defer dmnCtx.Release() // nolint
-				setGOConfig()
-				go startDynamicProfiler()
-
-				// In case of failure stderr will have the error emitted by child and parent will read
-				// those logs from the file set in daemon context
-				err = runPipeline(pipeline, ctx)
-
-				defer func() {
-					// if there is any error while initializing the components, we shouldn't delete this temp file.
-					// as this file is used by the parent to get the errors from it's child.
-					if err == nil {
-						rmErr := os.Remove(traceFilePath)
-						if rmErr != nil {
-							log.Err("mount : Failed to delete temp file: %s[%v]", traceFilePath, err)
+				var code int
+				func() {
+					defer dmnCtx.Release() // nolint
+					defer func() {
+						// Keep the trace for init failures / data-unsafe exits;
+						// the parent reads it when the child exits non-zero.
+						if code == 0 {
+							if rmErr := os.Remove(childTracePath); rmErr != nil && !os.IsNotExist(rmErr) {
+								log.Err("mount : Failed to delete temp file: %s[%v]", childTracePath, rmErr)
+							}
 						}
-					}
+					}()
+					setGOConfig()
+					go startDynamicProfiler()
+					monitor := startMonitorProcess(os.Getpid())
+					code = runPipeline(pipeline, ctx, childSigCh, monitor, true)
 				}()
 
-			} else { // execute in parent only
+				log.Info("mount: Child exiting with code %d", code)
+				_ = log.Destroy()
+				os.Exit(code)
+			}
 
-				childDone := make(chan struct{})
+			// execute in daemon parent: forward terminal signals and
+			// propagate the child's exit code.
+			parentSigCh := make(chan os.Signal, 4)
+			signal.Notify(parentSigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+			go forwardSignalsToChild(parentSigCh, child.Pid)
 
-				go monitorChild(child.Pid, childDone)
+			sigusr2 := make(chan os.Signal, 1)
+			signal.Notify(sigusr2, syscall.SIGUSR2)
 
-				select {
-				case <-sigusr2:
-					log.Info("mount: Child [%v] mounted successfully at %s", child.Pid, options.MountPath)
+			childResult := make(chan childWaitResult, 1)
+			go waitChildResult(child.Pid, childResult)
 
-				case <-childDone:
-					// Get error string from the child, stderr or child was redirected to a file
-					log.Info("mount: Child [%v] terminated from %s", child.Pid, options.MountPath)
+			select {
+			case <-sigusr2:
+				log.Info("mount: Child [%v] mounted successfully at %s", child.Pid, options.MountPath)
 
-					buff, err := os.ReadFile(dmnCtx.LogFileName)
-					if err != nil {
-						log.Err("mount: failed to read child [%v] failure logs [%s]", child.Pid, err.Error())
-						err = fmt.Errorf("failed to mount, please check logs [%s]", err.Error())
-					} else {
-						err = fmt.Errorf("%s", string(buff))
+			case res := <-childResult:
+				log.Info("mount: Child [%v] terminated from %s", child.Pid, options.MountPath)
+				code := res.exitCode(options.MountPath)
+				if code != 0 && code != shutdown.ExitDataUnsafe {
+					// Surface mount-init failure traces to the caller.
+					if buff, readErr := os.ReadFile(dmnCtx.LogFileName); readErr == nil {
+						fmt.Print(string(buff))
 					}
-
-					// Safe to delete the temp file.
-					rmErr := os.Remove(traceFilePath)
-					if rmErr != nil {
-						log.Err("mount : Failed to delete temp file: %s[%v]", traceFilePath, err)
-					}
-
-					return errors.Join(err, rmErr)
-
-				case <-time.After(options.WaitForMount):
-					log.Info("mount: Child [%v : %s] status check timeout", child.Pid, options.MountPath)
 				}
+				if code == 0 {
+					if rmErr := os.Remove(traceFilePath); rmErr != nil && !os.IsNotExist(rmErr) {
+						log.Err("mount : Failed to delete temp file: %s[%v]", traceFilePath, rmErr)
+					}
+				}
+				_ = log.Destroy()
+				os.Exit(code)
 
+			case <-time.After(options.WaitForMount):
+				log.Info("mount: Child [%v : %s] status check timeout, mount result unconfirmed",
+					child.Pid, options.MountPath)
 			}
 		} else {
+			sigCh := make(chan os.Signal, 4)
+			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+
 			if options.CPUProfile != "" {
 				os.Remove(options.CPUProfile)
 				f, err := os.Create(options.CPUProfile)
@@ -643,54 +660,18 @@ var mountCmd = &cobra.Command{
 
 			setGOConfig()
 			go startDynamicProfiler()
+			monitor := startMonitorProcess(os.Getpid())
 
 			log.Debug("mount: foreground enabled")
-			err = runPipeline(pipeline, context.Background())
-			if err != nil {
-				return err
-			}
-
-			if options.MemProfile != "" {
-				os.Remove(options.MemProfile)
-				f, err := os.Create(options.MemProfile)
-				if err != nil {
-					fmt.Printf("Error opening file for memprofile [%s]", err.Error())
-				}
-				defer f.Close()
-				runtime.GC()
-				if err = pprof.WriteHeapProfile(f); err != nil {
-					fmt.Printf("Error memory profiling [%s]", err.Error())
-				}
-			}
+			exitCode := runPipeline(pipeline, context.Background(), sigCh, monitor, false)
+			_ = log.Destroy()
+			os.Exit(exitCode)
 		}
 		return nil
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		return nil, cobra.ShellCompDirectiveDefault
 	},
-}
-
-func monitorChild(pid int, done chan struct{}) {
-	// Monitor the child process and if child terminates then exit
-	var wstatus syscall.WaitStatus
-
-	for {
-		// Wait for a signal from child
-		wpid, err := syscall.Wait4(pid, &wstatus, 0, nil)
-		if err != nil {
-			log.Err("Error retrieving child status [%s]", err.Error())
-			break
-		}
-
-		if wpid == pid {
-			// Exit only if child has exited
-			// Signal can be received on a state change of child as well
-			if wstatus.Exited() || wstatus.Signaled() || wstatus.Stopped() {
-				close(done)
-				return
-			}
-		}
-	}
 }
 
 func ignoreFuseOptions(opt string) bool {
@@ -703,47 +684,82 @@ func ignoreFuseOptions(opt string) bool {
 	return false
 }
 
-func runPipeline(pipeline *internal.Pipeline, ctx context.Context) error {
+func runPipeline(pipeline *internal.Pipeline, ctx context.Context, sigCh <-chan os.Signal,
+	monitor monitorHandle, watchParent bool) int {
+
 	pid := fmt.Sprintf("%v", os.Getpid())
 	common.TransferPipe += "_" + pid
 	common.PollingPipe += "_" + pid
 	log.Debug("Mount::runPipeline : blobfuse2 pid = %v, transfer pipe = %v, polling pipe = %v", pid, common.TransferPipe, common.PollingPipe)
 
-	go startMonitor(os.Getpid())
-
-	err := pipeline.Start(ctx)
+	cfg, err := shutdown.LoadConfig()
 	if err != nil {
-		log.Err("mount: error unable to start pipeline [%s]", err.Error())
-		return fmt.Errorf("unable to start pipeline [%s]", err.Error())
+		log.Err("Mount::runPipeline : invalid shutdown config [%v], using defaults", err)
+		cfg = shutdown.DefaultConfig()
+	}
+	coord := shutdown.New(cfg)
+
+	if watchParent {
+		go watchParentExiter(coord)
 	}
 
-	err = pipeline.Stop()
-	if err != nil {
-		log.Err("mount: error unable to stop pipeline [%s]", err.Error())
-		return fmt.Errorf("unable to stop pipeline [%s]", err.Error())
-	}
-
-	return nil
-}
-
-func startMonitor(pid int) {
-	if common.EnableMonitoring {
-		log.Debug("Mount::startMonitor : pid = %v, config-file = %v", pid, options.ConfigFile)
-		buf := new(bytes.Buffer)
-		rootCmd.SetOut(buf)
-		rootCmd.SetErr(buf)
-		rootCmd.SetArgs([]string{"health-monitor", fmt.Sprintf("--pid=%v", pid), fmt.Sprintf("--config-file=%s", options.ConfigFile)})
-		err := rootCmd.Execute()
-		if err != nil {
-			common.EnableMonitoring = false
-			log.Err("Mount::startMonitor : [%s]", err.Error())
+	// Terminal signals: the first begins graceful shutdown, the second forces
+	// the fast preserve-and-exit path, further signals terminate immediately.
+	go func() {
+		var arrivals int
+		for sig := range sigCh {
+			arrivals++
+			if arrivals == 1 {
+				coord.Begin(shutdown.TriggerSignal, sig.String())
+				continue
+			}
+			coord.Escalate(sig.String())
+			if arrivals >= 3 {
+				log.Crit("Mount::runPipeline : third terminal signal (%s), exiting immediately", sig)
+				if s, ok := sig.(syscall.Signal); ok {
+					os.Exit(128 + int(s))
+				}
+				os.Exit(shutdown.ExitGenericError)
+			}
 		}
+	}()
+
+	startCh := make(chan error, 1)
+	go func() {
+		startCh <- pipeline.Start(ctx)
+	}()
+
+	startAlreadyExited := false
+	var startErr error
+	select {
+	case startErr = <-startCh:
+		// fuse_main returned on its own (external fusermount -u/-z).
+		startAlreadyExited = true
+		coord.Begin(shutdown.TriggerFuseExit, "fuse session returned")
+	case <-coord.StartedCh():
+		// Signal/parent-exit path owns the phase sequence.
 	}
+
+	rt := &shutdownRuntime{
+		coord:     coord,
+		pipeline:  pipeline,
+		monitor:   monitor,
+		mountPath: options.MountPath,
+		pipes:     []string{common.TransferPipe, common.PollingPipe},
+	}
+	code := rt.runPhases(startErr, startAlreadyExited, startCh)
+
+	// A failed pipeline.Start (e.g. recovery failure before FUSE served) is
+	// never a clean outcome even when no uncommitted items were enumerated.
+	if startAlreadyExited && startErr != nil && code == shutdown.ExitOK {
+		code = shutdown.ExitGenericError
+	}
+	return code
 }
 
 // cleanupCachePath is a helper function to clean up cache directory for a component that is present in the pipeline.
 // componentName: the name of the component (e.g., "file_cache", "block_cache")
-func (opt *mountOptions) tempCacheCleanup() error {
+func (opt *mountOptions) tempCacheCleanup(protected *recovery.ProtectedSet) error {
 	// Check for global cleanup-on-start flag from cli.
 	var cleanupOnStart bool
 	_ = config.UnmarshalKey("cleanup-on-start", &cleanupOnStart)
@@ -752,7 +768,7 @@ func (opt *mountOptions) tempCacheCleanup() error {
 
 	for _, component := range components {
 		if common.ComponentInPipeline(options.Components, component) {
-			err := cleanupCachePath(component, cleanupOnStart)
+			err := cleanupCachePath(component, cleanupOnStart, protected)
 			if err != nil {
 				return fmt.Errorf("failed to clean up  cache for %s: %v", component, err)
 			}
@@ -762,7 +778,7 @@ func (opt *mountOptions) tempCacheCleanup() error {
 	return nil
 }
 
-func cleanupCachePath(componentName string, globalCleanupFlag bool) error {
+func cleanupCachePath(componentName string, globalCleanupFlag bool, protected *recovery.ProtectedSet) error {
 	// Get the path for the component
 	var cachePath string
 	_ = config.UnmarshalKey(componentName+".path", &cachePath)
@@ -776,28 +792,24 @@ func cleanupCachePath(componentName string, globalCleanupFlag bool) error {
 	var componentCleanupFlag bool
 	_ = config.UnmarshalKey(componentName+".cleanup-on-start", &componentCleanupFlag)
 
-	// Clean up if either global or component-specific flag is set
+	// Clean up if either global or component-specific flag is set, but never
+	// touch files protected by a recovery manifest.
 	if globalCleanupFlag || componentCleanupFlag {
-		if err := common.TempCacheCleanup(cachePath); err != nil {
+		var predicate func(string) bool
+		if protected != nil {
+			predicate = protected.IsProtected
+		}
+		report, err := common.TempCacheCleanupProtected(cachePath, predicate)
+		if err != nil {
 			return fmt.Errorf("failed to cleanup temp cache path: %s for %s component: %v", cachePath, componentName, err)
+		}
+		if report.Skipped > 0 {
+			log.Crit("cleanupCachePath : %s skipped %d recovery-protected entr(ies) under %s",
+				componentName, report.Skipped, cachePath)
 		}
 	}
 
 	return nil
-}
-
-func sigusrHandler(pipeline *internal.Pipeline, ctx context.Context) daemon.SignalHandlerFunc {
-	return func(sig os.Signal) error {
-		log.Crit("Mount::sigusrHandler : Signal %d received", sig)
-
-		var err error
-		if sig == syscall.SIGUSR1 {
-			log.Crit("Mount::sigusrHandler : SIGUSR1 received")
-			config.OnConfigChange()
-		}
-
-		return err
-	}
 }
 
 func setGOConfig() {

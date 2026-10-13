@@ -465,22 +465,26 @@ func (ac *AttrCache) GetAttr(options internal.GetAttrOptions) (*internal.ObjAttr
 	log.Trace("AttrCache::GetAttr : %s", options.Name)
 	truncatedPath := internal.TruncateDirName(options.Name)
 
-	if item, ok := ac.lru.Get(truncatedPath); ok {
-		if time.Since(item.cachedAt) < ac.cacheTimeout {
-			log.Debug("AttrCache::GetAttr : %s served from cache", options.Name)
-			if item.isNegativeEntry() {
-				return &internal.ObjAttr{}, syscall.ENOENT
-			}
+	if !options.BypassCache {
+		if item, ok := ac.lru.Get(truncatedPath); ok {
+			if time.Since(item.cachedAt) < ac.cacheTimeout {
+				log.Debug("AttrCache::GetAttr : %s served from cache", options.Name)
+				if item.isNegativeEntry() {
+					return &internal.ObjAttr{}, syscall.ENOENT
+				}
 
-			if item.attr != nil {
-				return item.attr, nil
-			}
+				if item.attr != nil {
+					return item.attr, nil
+				}
 
-			log.Crit("AttrCache::GetAttr : %s is marked as positive entry in cache but attr is nil", truncatedPath)
+				log.Crit("AttrCache::GetAttr : %s is marked as positive entry in cache but attr is nil", truncatedPath)
+			}
 		}
+	} else {
+		log.Debug("AttrCache::GetAttr : %s bypasses cache and is fetched from storage", options.Name)
 	}
 
-	// Cache miss: fetch from next component.
+	// Cache miss (or forced refresh): fetch from next component.
 	pathAttr, err := ac.NextComponent().GetAttr(options)
 
 	if err == nil {

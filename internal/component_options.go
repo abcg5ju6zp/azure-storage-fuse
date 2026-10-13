@@ -181,6 +181,11 @@ type ReadLinkOptions struct {
 type GetAttrOptions struct {
 	Name             string
 	RetrieveMetadata bool
+	// BypassCache skips any cached attribute lookup and forces a fetch from the
+	// next component. The fresh result is written back to the cache. It is used
+	// while reconciling an uncertain rename/delete response where cached
+	// attributes from the pre-operation window cannot be trusted.
+	BypassCache bool
 }
 
 type ChmodOptions struct {

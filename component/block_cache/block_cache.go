@@ -37,6 +37,7 @@ import (
 	"bytes"
 	"container/list"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -54,6 +55,7 @@ import (
 	"github.com/Azure/azure-storage-fuse/v2/common/log"
 	"github.com/Azure/azure-storage-fuse/v2/internal"
 	"github.com/Azure/azure-storage-fuse/v2/internal/handlemap"
+	"github.com/Azure/azure-storage-fuse/v2/internal/namespace"
 	"github.com/vibhansa-msft/tlru"
 )
 
@@ -88,6 +90,11 @@ type BlockCache struct {
 	stream          *Stream
 	lazyWrite       bool           // Flag to indicate if lazy write is enabled
 	fileCloseOpt    sync.WaitGroup // Wait group to wait for all async close operations to complete
+
+	// ns pins object identity across rename/delete so block commits from open
+	// handles follow the object to its current name and stale cleanup cannot
+	// remove blocks of a recreated object.
+	ns *namespace.Registry
 }
 
 // Structure defining your config parameters
@@ -369,6 +376,12 @@ func (bc *BlockCache) getDefaultMemSize() uint64 {
 func (bc *BlockCache) CreateFile(options internal.CreateFileOptions) (*handlemap.Handle, error) {
 	log.Trace("BlockCache::CreateFile : name=%s, mode=%d", options.Name, options.Mode)
 
+	// Serialize creates against rename/delete of the same name so a delete
+	// cannot resolve while the new object is being created and bound.
+	flock := bc.fileLocks.Get(options.Name)
+	flock.Lock()
+	defer flock.Unlock()
+
 	_, err := bc.NextComponent().CreateFile(options)
 	if err != nil {
 		log.Err("BlockCache::CreateFile : Failed to create file %s", options.Name)
@@ -383,6 +396,12 @@ func (bc *BlockCache) CreateFile(options internal.CreateFileOptions) (*handlemap
 	// Any write operation to file will mark it dirty and flush will then reupload
 	// handle.Flags.Set(handlemap.HandleFlagDirty)
 	bc.prepareHandleForBlockCache(handle)
+
+	// New object at the name: fresh naming generation and identity binding so
+	// stale tombstones/cache cleanup cannot shadow it.
+	bc.ns.TouchCreate(options.Name)
+	bc.ns.Bind(handle, options.Name, namespace.Identity{})
+
 	return handle, nil
 }
 
@@ -390,6 +409,13 @@ func (bc *BlockCache) CreateFile(options internal.CreateFileOptions) (*handlemap
 func (bc *BlockCache) OpenFile(options internal.OpenFileOptions) (*handlemap.Handle, error) {
 	log.Trace("BlockCache::OpenFile : name=%s, flags=%s, mode=%s",
 		options.Name, common.PrettyOpenFlags(options.Flags), options.Mode)
+
+	// Serialize opens against rename/delete of the same name so the bound
+	// identity and the remote existence check cannot disagree with a
+	// concurrent namespace change.
+	flock := bc.fileLocks.Get(options.Name)
+	flock.Lock()
+	defer flock.Unlock()
 
 	attr, err := bc.NextComponent().GetAttr(internal.GetAttrOptions{Name: options.Name})
 	if err != nil {
@@ -407,6 +433,10 @@ func (bc *BlockCache) OpenFile(options internal.OpenFileOptions) (*handlemap.Han
 
 	log.Debug("BlockCache::OpenFile : Size of file handle.Size %v", handle.Size)
 	bc.prepareHandleForBlockCache(handle)
+
+	// Bind to the object identity at the name so a rename/delete racing with
+	// this open makes the handle follow the object instead of the path.
+	bc.ns.Bind(handle, options.Name, bcIdentityOfAttr(attr))
 
 	if options.Flags&os.O_TRUNC != 0 {
 		// If file is opened in truncate or wronly mode then we need to wipe out the data consider current file size as 0
@@ -498,6 +528,20 @@ func (bc *BlockCache) FlushFile(options internal.FlushFileOptions) error {
 
 	// call commit blocks only if the handle is dirty
 	if options.Handle.Dirty() {
+		// Identity gate: a handle opened before a rename/delete must commit
+		// blocks to the object's current name; a deleted/overwritten object
+		// must never be committed back through its old path. Called with the
+		// handle lock held.
+		target := bc.resolveWriteBackTarget(options.Handle)
+		if target == "" {
+			if !options.Handle.Dirty() {
+				// Deleted: commit intentionally suppressed.
+				return nil
+			}
+			log.Err("BlockCache::FlushFile : block commit withheld for handle %d, object state uncertain", options.Handle.ID)
+			return syscall.EIO
+		}
+
 		err := bc.commitBlocks(options.Handle)
 		if err != nil {
 			log.Err("BlockCache::FlushFile : Failed to commit blocks for %s [%s]", options.Handle.Path, err.Error())
@@ -565,6 +609,10 @@ func (bc *BlockCache) releaseFileInternal(options internal.ReleaseFileOptions) e
 		bc.blockPool.Release(block)
 	}
 	options.Handle.Buffers.Cooked = nil
+
+	// All blocks are back in the pool and write-back decisions are done; drop
+	// the handle from namespace identity tracking.
+	bc.ns.Detach(options.Handle)
 
 	return nil
 }
@@ -1808,30 +1856,31 @@ func (bc *BlockCache) checkDiskUsage() bool {
 	return false
 }
 
-// invalidateDirectory: Recursively invalidates a directory in the file cache.
-func (bc *BlockCache) invalidateDirectory(name string) {
-	log.Trace("BlockCache::invalidateDirectory : %s", name)
-
-	if bc.tmpPath == "" {
-		return
-	}
-
-	localPath := filepath.Join(bc.tmpPath, name)
-	_ = os.RemoveAll(localPath)
-}
-
 // DeleteDir: Recursively invalidate the directory and its children
 func (bc *BlockCache) DeleteDir(options internal.DeleteDirOptions) error {
 	log.Trace("BlockCache::DeleteDir : %s", options.Name)
 
 	err := bc.NextComponent().DeleteDir(options)
-	if err != nil {
-		log.Err("BlockCache::DeleteDir : %s failed", options.Name)
+	switch {
+	case err == nil:
+		// Confirmed deletion.
+	case bcDefinitiveError(err):
+		log.Err("BlockCache::DeleteDir : %s failed [%s]", options.Name, err.Error())
+		// Marker blob may be missing; still drop whatever we cached locally.
+		bc.invalidateDirectoryGuarded(options.Name)
+		return err
+	default:
+		log.Warn("BlockCache::DeleteDir : uncertain response deleting %s [%s], reconciling", options.Name, err.Error())
+		if bc.probeDirectoryOutcome(options.Name, "", false) {
+			bc.invalidateDirectoryGuarded(options.Name)
+			return nil
+		}
+		bc.invalidateDirectoryGuarded(options.Name)
 		return err
 	}
 
-	bc.invalidateDirectory(options.Name)
-	return err
+	bc.invalidateDirectoryGuarded(options.Name)
+	return nil
 }
 
 // RenameDir: Recursively invalidate the source directory and its children
@@ -1839,12 +1888,80 @@ func (bc *BlockCache) RenameDir(options internal.RenameDirOptions) error {
 	log.Trace("BlockCache::RenameDir : src=%s, dst=%s", options.Src, options.Dst)
 
 	err := bc.NextComponent().RenameDir(options)
-	if err != nil {
+	switch {
+	case err == nil:
+		// Confirmed rename.
+	case bcDefinitiveError(err):
 		log.Err("BlockCache::RenameDir : error %s [%s]", options.Src, err.Error())
+		return err
+	default:
+		log.Warn("BlockCache::RenameDir : uncertain response renaming %s -> %s [%s], reconciling", options.Src, options.Dst, err.Error())
+		if bc.probeDirectoryOutcome(options.Src, options.Dst, true) {
+			bc.invalidateDirectoryGuarded(options.Src)
+			bc.invalidateDirectoryGuarded(options.Dst)
+			return nil
+		}
 		return err
 	}
 
-	bc.invalidateDirectory(options.Src)
+	bc.invalidateDirectoryGuarded(options.Src)
+	return nil
+}
+
+// deleteFileLegacyLocked keeps the original block-cache delete behaviour for
+// names with no open handles and no on-disk blocks. The path lock is held.
+func (bc *BlockCache) deleteFileLegacyLocked(options internal.DeleteFileOptions) error {
+	err := bc.NextComponent().DeleteFile(options)
+	if err != nil {
+		log.Err("BlockCache::DeleteFile : error  %s [%s]", options.Name, err.Error())
+		return err
+	}
+
+	bc.removeDiskBlocksGuarded(options.Name, bc.ns.Generation(options.Name))
+	return nil
+}
+
+// deleteFileLocked is the identity-safe delete for cached/open files: open
+// handles are bound to the deleted object so their late block commits cannot
+// recreate it, and disk cleanup is fenced by the name generation.
+func (bc *BlockCache) deleteFileLocked(options internal.DeleteFileOptions) error {
+	txn := bc.ns.PrepareDelete(options.Name, namespace.Identity{}, true)
+
+	// Keep any in-flight block commit out of the delete: flush holds the
+	// handle lock, so taking it here (until the local commit is done) means an
+	// upload can neither precede a delete in a losing race nor recreate the
+	// object afterwards.
+	unlockHandles := bc.lockAttachedHandles(txn.SrcID)
+	defer unlockHandles()
+
+	err := bc.NextComponent().DeleteFile(options)
+	if err != nil {
+		if bcDefinitiveError(err) {
+			log.Err("BlockCache::DeleteFile : error  %s [%s]", options.Name, err.Error())
+			bc.ns.Rollback(txn)
+			return err
+		}
+
+		switch bc.reconcileDelete(txn) {
+		case namespace.DeleteCommitted:
+			log.Info("BlockCache::DeleteFile : delete of %s confirmed by state probe", options.Name)
+		case namespace.DeleteRecreated:
+			log.Warn("BlockCache::DeleteFile : %s recreated with a different object, old handles will not commit blocks", options.Name)
+			bc.ns.NoteExternalPresent(options.Name)
+		case namespace.DeleteRolledBack:
+			log.Warn("BlockCache::DeleteFile : delete of %s did not take, returning original error", options.Name)
+			return err
+		default:
+			log.Err("BlockCache::DeleteFile : uncertain outcome for %s [%s], fencing write-back", options.Name, err.Error())
+			bc.ns.MarkAmbiguous(txn.SrcID)
+			return err
+		}
+	}
+
+	gen, conflict := bc.ns.CommitDelete(txn)
+	if !conflict {
+		bc.removeDiskBlocksGuarded(options.Name, gen)
+	}
 	return nil
 }
 
@@ -1856,57 +1973,112 @@ func (bc *BlockCache) DeleteFile(options internal.DeleteFileOptions) error {
 	flock.Lock()
 	defer flock.Unlock()
 
-	err := bc.NextComponent().DeleteFile(options)
-	if err != nil {
-		log.Err("BlockCache::DeleteFile : error  %s [%s]", options.Name, err.Error())
-		return err
+	// Fast path: no bound open handles and no on-disk blocks.
+	if !bc.ns.HasBinding(options.Name) && flock.Count() == 0 && !bc.hasDiskBlocks(options.Name) {
+		return bc.deleteFileLegacyLocked(options)
 	}
-
-	localPath := filepath.Join(bc.tmpPath, options.Name)
-	files, err := filepath.Glob(localPath + "*")
-	if err == nil {
-		for _, f := range files {
-			if err := os.Remove(f); err != nil {
-				break
-			}
-		}
-	}
-
-	return err
+	return bc.deleteFileLocked(options)
 }
 
-// RenameFile: Invalidate the file in local cache.
-func (bc *BlockCache) RenameFile(options internal.RenameFileOptions) error {
-	log.Trace("BlockCache::RenameFile : src=%s, dst=%s", options.Src, options.Dst)
-
-	sflock := bc.fileLocks.Get(options.Src)
-	sflock.Lock()
-	defer sflock.Unlock()
-
-	dflock := bc.fileLocks.Get(options.Dst)
-	dflock.Lock()
-	defer dflock.Unlock()
-
+// renameFileLegacyLocked keeps the original block-cache rename behaviour for
+// uncached names without open handles. Both path locks are held.
+func (bc *BlockCache) renameFileLegacyLocked(options internal.RenameFileOptions) error {
 	err := bc.NextComponent().RenameFile(options)
 	if err != nil {
 		log.Err("BlockCache::RenameFile : %s failed to rename file [%s]", options.Src, err.Error())
 		return err
 	}
 
-	localSrcPath := filepath.Join(bc.tmpPath, options.Src)
-	localDstPath := filepath.Join(bc.tmpPath, options.Dst)
-
-	files, err := filepath.Glob(localSrcPath + "*")
-	if err == nil {
-		for _, f := range files {
-			err = os.Rename(f, strings.Replace(f, localSrcPath, localDstPath, 1))
-			if err != nil {
-				break
+	srcPrefix := bc.diskBlockPrefix(options.Src)
+	dstPrefix := bc.diskBlockPrefix(options.Dst)
+	if srcPrefix != "" && dstPrefix != "" {
+		files, gerr := filepath.Glob(srcPrefix + "*")
+		if gerr == nil {
+			for _, f := range files {
+				if rerr := os.Rename(f, strings.Replace(f, srcPrefix, dstPrefix, 1)); rerr != nil {
+					break
+				}
 			}
 		}
 	}
+	return nil
+}
 
-	return err
+// renameFileLocked is the identity-safe rename for cached/open files: it pins
+// the source identity and destination precondition, performs the remote rename,
+// commits the local mapping only after confirmation, and reconciles uncertain
+// responses from actual src/dst state. Both path locks are held.
+func (bc *BlockCache) renameFileLocked(options internal.RenameFileOptions) error {
+	txn := bc.ns.PrepareRename(options.Src, options.Dst,
+		bcIdentityOfAttr(options.SrcAttr), bcIdentityOfAttr(options.DstAttr),
+		options.SrcAttr != nil, options.DstAttr != nil)
+
+	// Block in-flight block commits on both objects for the entire remote
+	// operation and local commit, so no upload can land on a name the rename
+	// is concurrently moving or replacing.
+	unlockHandles := bc.lockAttachedHandles(txn.SrcID, txn.DstID)
+	defer unlockHandles()
+
+	err := bc.NextComponent().RenameFile(options)
+	if err != nil {
+		if bcDefinitiveError(err) {
+			log.Err("BlockCache::RenameFile : %s failed to rename file [%s]", options.Src, err.Error())
+			bc.ns.Rollback(txn)
+			return err
+		}
+
+		switch bc.reconcileRename(txn) {
+		case namespace.RenameCommitted:
+			log.Info("BlockCache::RenameFile : rename %s -> %s confirmed by state probe", options.Src, options.Dst)
+		case namespace.RenameSrcRecreated:
+			log.Warn("BlockCache::RenameFile : %s recreated during rename %s -> %s", options.Src, options.Src, options.Dst)
+			bc.ns.NoteExternalPresent(options.Src)
+		case namespace.RenameComplete:
+			log.Warn("BlockCache::RenameFile : finishing partial rename %s -> %s", options.Src, options.Dst)
+			delErr := bc.NextComponent().DeleteFile(internal.DeleteFileOptions{Name: options.Src})
+			if delErr != nil && !errors.Is(delErr, syscall.ENOENT) {
+				log.Err("BlockCache::RenameFile : failed to finish partial rename [%s]", delErr.Error())
+				// Keep cached blocks (open handles may be staging from them)
+				// and fence write-back until identity is re-verified.
+				bc.ns.MarkAmbiguous(txn.SrcID)
+				return err
+			}
+		case namespace.RenameRolledBack:
+			log.Warn("BlockCache::RenameFile : rename %s -> %s did not take, returning original error", options.Src, options.Dst)
+			return err
+		default:
+			log.Err("BlockCache::RenameFile : uncertain outcome for %s -> %s [%s], fencing write-back", options.Src, options.Dst, err.Error())
+			bc.ns.MarkAmbiguous(txn.SrcID)
+			return err
+		}
+	}
+
+	plan := bc.ns.CommitRenameLockedHandles(txn)
+	bc.applyRenameDisk(options, plan)
+	return nil
+}
+
+// RenameFile: Invalidate the file in local cache.
+func (bc *BlockCache) RenameFile(options internal.RenameFileOptions) error {
+	log.Trace("BlockCache::RenameFile : src=%s, dst=%s", options.Src, options.Dst)
+
+	// POSIX no-op: do not copy+delete a blob onto itself.
+	if options.Src == options.Dst {
+		return nil
+	}
+
+	unlock1, unlock0 := bc.lockTwoNames(options.Src, options.Dst)
+	defer unlock0()
+	defer unlock1()
+
+	// Fast path: ordinary rename of a file without bound open handles or
+	// on-disk blocks.
+	if !bc.ns.HasBinding(options.Src) && !bc.ns.HasBinding(options.Dst) &&
+		bc.fileLocks.Get(options.Src).Count() == 0 && bc.fileLocks.Get(options.Dst).Count() == 0 &&
+		!bc.hasDiskBlocks(options.Src) && !bc.hasDiskBlocks(options.Dst) {
+		return bc.renameFileLegacyLocked(options)
+	}
+	return bc.renameFileLocked(options)
 }
 
 func (bc *BlockCache) SyncFile(options internal.SyncFileOptions) error {
@@ -1972,6 +2144,7 @@ func (bc *BlockCache) StatFs() (*syscall.Statfs_t, bool, error) {
 func NewBlockCacheComponent() internal.Component {
 	comp := &BlockCache{
 		fileLocks: common.NewLockMap(),
+		ns:        namespace.NewRegistry(),
 	}
 	comp.SetName(compName)
 	return comp

@@ -51,6 +51,7 @@ import (
 	"github.com/Azure/azure-storage-fuse/v2/common/log"
 	"github.com/Azure/azure-storage-fuse/v2/internal"
 	"github.com/Azure/azure-storage-fuse/v2/internal/handlemap"
+	"github.com/Azure/azure-storage-fuse/v2/internal/namespace"
 	"github.com/Azure/azure-storage-fuse/v2/internal/stats_manager"
 
 	"github.com/spf13/cobra"
@@ -84,6 +85,25 @@ type FileCache struct {
 
 	lazyWrite    bool
 	fileCloseOpt sync.WaitGroup
+
+	// invalidateWait tracks asynchronous directory-invalidation goroutines so
+	// Stop can wait for them instead of letting them touch a torn-down cache.
+	invalidateWait sync.WaitGroup
+
+	// ns pins object identity across rename/delete so open handles and cache
+	// entries follow the object rather than the path string they were opened
+	// with, and naming generations fence stale cache cleanup.
+	ns *namespace.Registry
+}
+
+// invalidateDirectoryAsync runs a generation-guarded directory invalidation in
+// the background and tracks it so Stop waits for completion.
+func (fc *FileCache) invalidateDirectoryAsync(name string) {
+	fc.invalidateWait.Add(1)
+	go func() {
+		defer fc.invalidateWait.Done()
+		fc.invalidateDirectoryGuarded(name)
+	}()
 }
 
 // Structure defining your config parameters
@@ -177,6 +197,10 @@ func (fc *FileCache) Stop() error {
 		log.Info("FileCache::Stop : Waiting for async close to complete")
 		fc.fileCloseOpt.Wait()
 	}
+
+	// Wait for background directory invalidations so they cannot outlive the
+	// cache policy and logger.
+	fc.invalidateWait.Wait()
 
 	_ = fc.policy.ShutdownPolicy()
 	_ = common.TempCacheCleanup(fc.tmpPath)
@@ -450,40 +474,6 @@ func (fc *FileCache) validateObjectName(name string) error {
 	return nil
 }
 
-// invalidateDirectory: Recursively invalidates a directory in the file cache.
-func (fc *FileCache) invalidateDirectory(name string) {
-	log.Trace("FileCache::invalidateDirectory : %s", name)
-
-	localPath := filepath.Join(fc.tmpPath, name)
-	_, err := os.Stat(localPath)
-	if os.IsNotExist(err) {
-		log.Info("FileCache::invalidateDirectory : %s does not exist in local cache.", name)
-		return
-	} else if err != nil {
-		log.Debug("FileCache::invalidateDirectory : %s stat err [%s].", name, err.Error())
-		return
-	}
-	// TODO : wouldn't this cause a race condition? a thread might get the lock before we purge - and the file would be non-existent
-	err = filepath.WalkDir(localPath, func(path string, d fs.DirEntry, err error) error {
-		if err == nil && d != nil {
-			log.Debug("FileCache::invalidateDirectory : %s (%v) getting removed from cache", path, d.IsDir())
-			if !d.IsDir() {
-				fc.policy.CachePurge(path)
-			} else {
-				_ = deleteFile(path)
-			}
-		}
-		return nil
-	})
-
-	if err != nil {
-		log.Debug("FileCache::invalidateDirectory : Failed to iterate directory %s [%s].", localPath, err.Error())
-		return
-	}
-
-	_ = deleteFile(localPath)
-}
-
 // Note: The primary purpose of the file cache is to keep track of files that are opened by the user.
 // So we do not need to support some APIs like Create Directory since the file cache will manage
 // creating local directories as needed.
@@ -498,14 +488,32 @@ func (fc *FileCache) DeleteDir(options internal.DeleteDirOptions) error {
 	}
 
 	err := fc.NextComponent().DeleteDir(options)
-	if err != nil {
-		log.Err("FileCache::DeleteDir : %s failed", options.Name)
+	switch {
+	case err == nil:
+		// Confirmed deletion.
+	case isDefinitiveRemoteError(err):
+		log.Err("FileCache::DeleteDir : %s failed [%s]", options.Name, err.Error())
 		// There is a chance that meta file for directory was not created in which case
 		// rest api delete will fail while we still need to cleanup the local cache for the same
+		fc.invalidateDirectoryAsync(options.Name)
+		return err
+	default:
+		// The response is uncertain: reconcile against actual state before
+		// deciding what to expose locally.
+		log.Warn("FileCache::DeleteDir : uncertain response deleting %s [%s], reconciling", options.Name, err.Error())
+		if fc.probeDirectoryOutcome(options.Name, "", false) {
+			log.Info("FileCache::DeleteDir : delete of %s confirmed by state probe", options.Name)
+			fc.invalidateDirectoryAsync(options.Name)
+			return nil
+		}
+		// Cannot prove the outcome: force a refetch but keep the original error
+		// so callers know the operation was uncertain.
+		fc.invalidateDirectoryAsync(options.Name)
+		return err
 	}
 
-	go fc.invalidateDirectory(options.Name)
-	return err
+	fc.invalidateDirectoryAsync(options.Name)
+	return nil
 }
 
 // Creates a new object attribute
@@ -725,12 +733,27 @@ func (fc *FileCache) RenameDir(options internal.RenameDirOptions) error {
 	}
 
 	err := fc.NextComponent().RenameDir(options)
-	if err != nil {
+	switch {
+	case err == nil:
+		// Confirmed rename.
+	case isDefinitiveRemoteError(err):
 		log.Err("FileCache::RenameDir : error %s [%s]", options.Src, err.Error())
+		return err
+	default:
+		// Uncertain response: reconcile actual src/dst state. A directory move
+		// may be partial (children are moved one by one), so when in doubt
+		// invalidate both subtrees to force per-path refetch.
+		log.Warn("FileCache::RenameDir : uncertain response renaming %s -> %s [%s], reconciling", options.Src, options.Dst, err.Error())
+		if fc.probeDirectoryOutcome(options.Src, options.Dst, true) {
+			log.Info("FileCache::RenameDir : rename %s -> %s confirmed by state probe", options.Src, options.Dst)
+			fc.invalidateDirectoryAsync(options.Src)
+			fc.invalidateDirectoryAsync(options.Dst)
+			return nil
+		}
 		return err
 	}
 
-	go fc.invalidateDirectory(options.Src)
+	fc.invalidateDirectoryAsync(options.Src)
 	// TLDR: Dst is guaranteed to be non-existent or empty.
 	// Note: We do not need to invalidate Dst due to the logic in our FUSE connector, see comments there.
 	return nil
@@ -801,6 +824,12 @@ func (fc *FileCache) CreateFile(options internal.CreateFileOptions) (*handlemap.
 		handle.Flags.Set(handlemap.HandleFlagDirty)
 	}
 
+	// A brand new object occupies the name: start a fresh generation (so stale
+	// tombstones/cache cleanup cannot shadow it) and bind the handle to the new
+	// object identity.
+	fc.ns.TouchCreate(options.Name)
+	fc.ns.Bind(handle, options.Name, namespace.Identity{})
+
 	return handle, nil
 }
 
@@ -853,22 +882,16 @@ func (fc *FileCache) DeleteFile(options internal.DeleteFileOptions) error {
 	flock.Lock()
 	defer flock.Unlock()
 
-	err := fc.NextComponent().DeleteFile(options)
-	err = fc.validateStorageError(options.Name, err, "DeleteFile", false)
-	if err != nil {
-		log.Err("FileCache::DeleteFile : error  %s [%s]", options.Name, err.Error())
-		return err
-	}
-
 	localPath := filepath.Join(fc.tmpPath, options.Name)
-	err = deleteFile(localPath)
-	if err != nil && !os.IsNotExist(err) {
-		log.Err("FileCache::DeleteFile : failed to delete local file %s [%s]", localPath, err.Error())
+
+	// Fast path: nothing local to protect (no cache file, no open handles).
+	if !localPathExists(localPath) && flock.Count() == 0 {
+		return fc.deleteFileLegacyLocked(options, localPath)
 	}
 
-	fc.policy.CachePurge(localPath)
-
-	return nil
+	// Identity-safe path: pin the object and suppress late write-back from
+	// open handles once the remote delete is confirmed.
+	return fc.deleteFileLocked(options)
 }
 
 // isDownloadRequired: Whether or not the file needs to be downloaded to local cache.
@@ -1111,6 +1134,11 @@ func (fc *FileCache) OpenFile(options internal.OpenFileOptions) (*handlemap.Hand
 	log.Info("FileCache::OpenFile : file=%s, fd=%d", options.Name, f.Fd())
 	handle.SetFileObject(f)
 
+	// Bind the handle to the object identity currently registered at the name
+	// (reusing the ID shared by already-open handles of the same file) so a
+	// concurrent rename/delete makes this handle follow the object.
+	fc.ns.Bind(handle, options.Name, identityOfAttr(attr))
+
 	return handle, nil
 }
 
@@ -1122,55 +1150,80 @@ func (fc *FileCache) ReleaseFile(options internal.ReleaseFileOptions) error {
 	fc.fileCloseOpt.Add(1)
 	defer fc.fileCloseOpt.Done()
 
-	localPath := filepath.Join(fc.tmpPath, options.Handle.Path)
-
-	// FlushFile takes lock on the given file to ensure that while close is in progress no one can open the file again
+	// FlushFile takes lock on the given file to ensure that while close is in progress no one can open the file again.
+	// Flush resolves the object identity first, so a rename/delete that raced with this handle
+	// is followed (write to the new name) or suppressed (object deleted), never replayed on the old path.
 	err := fc.FlushFile(internal.FlushFileOptions{Handle: options.Handle, CloseInProgress: true}) //nolint
 	if err != nil {
 		log.Err("FileCache::releaseFileInternal : failed to flush file %s", options.Handle.Path)
 		return err
 	}
 
+	// Resolve the name this handle actually belongs to after the flush (a
+	// rename commit may have repathed it) and the generation the local cache
+	// teardown is allowed to touch.
+	effectivePath, gen, deleted := fc.releaseBinding(options.Handle)
+
 	// Take lock and decrement the handle count for this file.
 	// We need to take lock here to make sure that cache policy does not delete
 	// the file while we are in the middle of closing it and updating handle count.
-	flock := fc.fileLocks.Get(options.Handle.Path)
+	flock := fc.fileLocks.Get(effectivePath)
 	flock.Lock()
 	defer flock.Unlock()
 
 	f := options.Handle.GetFileObject()
 	if f == nil {
-		log.Err("FileCache::releaseFileInternal : error [missing fd in handle object] %s", options.Handle.Path)
+		log.Err("FileCache::releaseFileInternal : error [missing fd in handle object] %s", effectivePath)
 		return syscall.EBADF
 	}
 
 	err = f.Close()
 	if err != nil {
-		log.Err("FileCache::releaseFileInternal : error closing file %s(%d) [%s]", options.Handle.Path, int(f.Fd()), err.Error())
+		log.Err("FileCache::releaseFileInternal : error closing file %s(%d) [%s]", effectivePath, int(f.Fd()), err.Error())
 		return err
 	}
 
 	flock.Dec()
+	// The handle is done; drop it from the namespace tracking.
+	fc.ns.Detach(options.Handle)
+
+	localPath := filepath.Join(fc.tmpPath, effectivePath)
+
+	// ownsPath reports whether this release may tear down the cache state at the
+	// resolved path. A naming generation newer than the binding's means another
+	// object reoccupied the name (delete+recreate, rename+recreate): its cache
+	// file and policy entry must survive this old handle going away.
+	ownsPath := func() bool {
+		if gen == 0 {
+			return true // untracked path: legacy behaviour
+		}
+		return fc.ns.CheckGen(effectivePath, gen)
+	}
 
 	// If it is an fsync op then purge the file
 	if options.Handle.Fsynced() {
-		log.Trace("FileCache::releaseFileInternal : fsync/sync op, purging %s", options.Handle.Path)
-		localPath := filepath.Join(fc.tmpPath, options.Handle.Path)
+		log.Trace("FileCache::releaseFileInternal : fsync/sync op, purging %s", effectivePath)
 
 		// Another handle may still use this path, possibly for a new file created after a rename.
 		// In that case, leave deletion to the cache policy, which skips files with open handles.
-		if flock.Count() == 0 {
+		if flock.Count() == 0 && ownsPath() {
 			err = deleteFile(localPath)
 			if err != nil && !os.IsNotExist(err) {
 				log.Err("FileCache::releaseFileInternal : failed to delete local file %s [%s]", localPath, err.Error())
 			}
+			fc.policy.CachePurge(localPath)
+		} else if flock.Count() == 0 && deleted {
+			// Object was deleted while open and the name was not recreated: the
+			// unlinked local inode is closed now, make sure no policy trace is
+			// left behind.
+			fc.policy.CachePurge(localPath)
 		}
-
-		fc.policy.CachePurge(localPath)
 		return nil
 	}
 
-	fc.policy.CacheInvalidate(localPath) // Invalidate the file from the local cache.
+	if ownsPath() {
+		fc.policy.CacheInvalidate(localPath) // Invalidate the file from the local cache.
+	}
 	return nil
 }
 
@@ -1324,14 +1377,13 @@ func (fc *FileCache) FlushFile(options internal.FlushFileOptions) error {
 	//defer exectime.StatTimeCurrentBlock("FileCache::FlushFile")()
 	log.Trace("FileCache::FlushFile : handle=%d, path=%s", options.Handle.ID, options.Handle.Path)
 
-	// The file should already be in the cache since CreateFile/OpenFile was called before and a shared lock was acquired.
-	localPath := filepath.Join(fc.tmpPath, options.Handle.Path)
-	fc.policy.CacheValid(localPath)
-
 	// Fast-path: skip the lock entirely when no upload will happen.
 	// libfuse calls flush on every close() of a file descriptor, even when nothing was written,
 	// so this avoids contention for the common read-only / clean-handle case.
 	if !options.Handle.Dirty() {
+		// Still keep the local cache entry fresh using the name the handle
+		// currently resolves to.
+		fc.policy.CacheValid(filepath.Join(fc.tmpPath, options.Handle.Path))
 		return nil
 	}
 
@@ -1342,12 +1394,42 @@ func (fc *FileCache) FlushFile(options internal.FlushFileOptions) error {
 		return nil
 	}
 
-	// Acquire per-file lock to serialize concurrent upload operations for the same file.
-	// Multiple libfuse_flush calls (from dup'd fds) can arrive in parallel and each would
-	// attempt PutBlock + PutBlockList, causing InvalidBlockList errors on the storage side.
-	flock := fc.fileLocks.Get(options.Handle.Path)
-	flock.Lock()
+	// Acquire the lock of the name the handle currently resolves to, then
+	// resolve object identity under that lock. A rename/delete commit holds
+	// the locks of both names, so a commit cannot sneak in between the
+	// resolution and the upload: if the object moved while we were acquiring,
+	// retry on the new name. A handle opened before a rename/delete must
+	// upload to the object's current name or not at all (deleted object); it
+	// must never recreate the old name.
+	var flock *common.LockMapItem
+	var target string
+	for {
+		options.Handle.RLock()
+		currentName := options.Handle.Path
+		options.Handle.RUnlock()
+
+		flock = fc.fileLocks.Get(currentName)
+		flock.Lock()
+
+		target = fc.resolveWriteBackTarget(options.Handle)
+		if target == "" || target == currentName {
+			break
+		}
+		// Object was renamed to another name while we were taking the lock;
+		// drop the stale source/destination lock and follow the object.
+		flock.Unlock()
+	}
 	defer flock.Unlock()
+
+	if target == "" {
+		if !options.Handle.Dirty() {
+			// Deleted: write-back was intentionally suppressed.
+			return nil
+		}
+		// Ambiguous outcome that could not be verified: do not upload.
+		log.Err("FileCache::FlushFile : write-back withheld for handle %d, object state uncertain", options.Handle.ID)
+		return syscall.EIO
+	}
 
 	// Re-check Dirty() after acquiring the lock.
 	// Another goroutine that held the lock before us may have already uploaded the file
@@ -1355,9 +1437,13 @@ func (fc *FileCache) FlushFile(options internal.FlushFileOptions) error {
 	// PutBlockList could race with the next write sequence, producing InvalidBlockList).
 	if !options.Handle.Dirty() {
 		log.Debug("FileCache::FlushFile : %s handle %d is no longer dirty after acquiring lock, skipping upload",
-			options.Handle.Path, options.Handle.ID)
+			target, options.Handle.ID)
 		return nil
 	}
+
+	// The file should already be in the cache since CreateFile/OpenFile was called before and a shared lock was acquired.
+	localPath := filepath.Join(fc.tmpPath, target)
+	fc.policy.CacheValid(localPath)
 
 	f := options.Handle.GetFileObject()
 	if f == nil {
@@ -1408,7 +1494,7 @@ func (fc *FileCache) FlushFile(options internal.FlushFileOptions) error {
 	}
 	err = fc.NextComponent().CopyFromFile(
 		internal.CopyFromFileOptions{
-			Name: options.Handle.Path,
+			Name: target,
 			File: uploadHandle,
 		})
 
@@ -1430,22 +1516,23 @@ func (fc *FileCache) FlushFile(options internal.FlushFileOptions) error {
 
 	// If chmod was done on the file before it was uploaded to container then setting up mode would have been missed
 	// Such file names are added to this map and here post upload we try to set the mode correctly
-	_, found := fc.missedChmodList.Load(options.Handle.Path)
+	_, found := fc.missedChmodList.Load(target)
 	if found {
 		// If file is found in map it means last chmod was missed on this
 		// Delete the entry from map so that any further flush do not try to update the mode again
-		fc.missedChmodList.Delete(options.Handle.Path)
+		fc.missedChmodList.Delete(target)
 
 		// When chmod on container was missed, local file was updated with correct mode
-		// Here take the mode from local cache and update the container accordingly
-		localPath := filepath.Join(fc.tmpPath, options.Handle.Path)
+		// Here take the mode from local cache and update the container accordingly.
+		// Use the resolved target: a rename followed by flush must set the mode
+		// on the object's current name, not the stale handle path.
 		info, err := os.Lstat(localPath)
 		if err == nil {
-			err = fc.Chmod(internal.ChmodOptions{Name: options.Handle.Path, Mode: info.Mode()})
+			err = fc.Chmod(internal.ChmodOptions{Name: target, Mode: info.Mode()})
 			if err != nil {
 				// chmod was missed earlier for this file and doing it now also
 				// resulted in error so ignore this one and proceed for flush handling
-				log.Err("FileCache::FlushFile : %s chmod failed [%s]", options.Handle.Path, err.Error())
+				log.Err("FileCache::FlushFile : %s chmod failed [%s]", target, err.Error())
 			}
 		}
 	}
@@ -1529,61 +1616,32 @@ func (fc *FileCache) RenameFile(options internal.RenameFileOptions) error {
 		return err
 	}
 
-	sflock := fc.fileLocks.Get(options.Src)
-	sflock.Lock()
-	defer sflock.Unlock()
-
-	dflock := fc.fileLocks.Get(options.Dst)
-	dflock.Lock()
-	defer dflock.Unlock()
-
-	err := fc.NextComponent().RenameFile(options)
-	err = fc.validateStorageError(options.Src, err, "RenameFile", false)
-	if err != nil {
-		log.Err("FileCache::RenameFile : %s failed to rename file [%s]", options.Src, err.Error())
-		return err
+	// Rename onto itself is a POSIX no-op. Short-circuit before the remote
+	// copy+delete, which would otherwise delete the object.
+	if options.Src == options.Dst {
+		return nil
 	}
+
+	// Acquire both path locks in a stable order so concurrent renames (e.g.
+	// a->b racing b->a) cannot deadlock.
+	unlock1, unlock0 := fc.lockTwoNames(options.Src, options.Dst)
+	defer unlock0()
+	defer unlock1()
 
 	localSrcPath := filepath.Join(fc.tmpPath, options.Src)
 	localDstPath := filepath.Join(fc.tmpPath, options.Dst)
 
-	// in case of git clone multiple rename requests come for which destination files already exists in system
-	// if we do not perform rename operation locally and those destination files are cached then next time they are read
-	// we will be serving the wrong content (as we did not rename locally, we still be having older destination files with
-	// stale content). We either need to remove dest file as well from cache or just run rename to replace the content.
-	err = os.Rename(localSrcPath, localDstPath)
-	if err != nil && !os.IsNotExist(err) {
-		log.Err("FileCache::RenameFile : %s failed to rename local file %s [%s]", localSrcPath, localDstPath, err.Error())
+	// Fast path: an ordinary rename of an uncached file with no open handles
+	// keeps the legacy behaviour, including identical error codes.
+	if !localPathExists(localSrcPath) && !localPathExists(localDstPath) &&
+		fc.fileLocks.Get(options.Src).Count() == 0 && fc.fileLocks.Get(options.Dst).Count() == 0 {
+		return fc.renameFileLegacyLocked(options, localSrcPath, localDstPath)
 	}
 
-	if err != nil {
-		// If there was a problem in local rename then delete the destination file
-		// it might happen that dest file was already there and local rename failed
-		// so deleting local dest file ensures next open of that will get the updated file from container
-		err = deleteFile(localDstPath)
-		if err != nil && !os.IsNotExist(err) {
-			log.Err("FileCache::RenameFile : failed to delete local file %s [%s]", localDstPath, err.Error())
-		}
-
-		fc.policy.CachePurge(localDstPath)
-	}
-
-	err = deleteFile(localSrcPath)
-	if err != nil && !os.IsNotExist(err) {
-		log.Err("FileCache::RenameFile : failed to delete local file %s [%s]", localSrcPath, err.Error())
-	}
-
-	fc.policy.CachePurge(localSrcPath)
-
-	if fc.cacheTimeout == 0 {
-		// Destination file needs to be deleted immediately
-		fc.policy.CachePurge(localDstPath)
-	} else {
-		// Add destination file to cache, it will be removed on timeout
-		fc.policy.CacheValid(localDstPath)
-	}
-
-	return nil
+	// Identity-safe path: pin source identity and destination precondition,
+	// keep the local mapping rollback-able until the remote result is known,
+	// then make all open handles follow the object.
+	return fc.renameFileLocked(options)
 }
 
 // TruncateFile: Update the file with its new size.
@@ -1745,6 +1803,7 @@ func (fc *FileCache) FileUsed(name string) error {
 func NewFileCacheComponent() internal.Component {
 	comp := &FileCache{
 		fileLocks: common.NewLockMap(),
+		ns:        namespace.NewRegistry(),
 	}
 	comp.SetName(compName)
 	config.AddConfigChangeEventListener(comp)

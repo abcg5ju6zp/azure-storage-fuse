@@ -49,6 +49,17 @@ type HandleID uint64
 
 const InvalidHandleID HandleID = 0
 
+// ObjectID is the immutable identity of the object a handle was opened on.
+// Unlike Path it does not change when the object is renamed: the namespace
+// registry resolves an ObjectID to the object's current name and state so that
+// late read/write/flush/release operations never write back through a stale
+// path string. Zero means the handle is not tracked by the namespace registry
+// (e.g. handles created in tests); such handles keep legacy path-based
+// behaviour.
+type ObjectID uint64
+
+const InvalidObjectID ObjectID = 0
+
 // Flags represented in BitMap for various flags in the handle
 const (
 	HandleFlagUnknown uint64 = iota
@@ -82,8 +93,37 @@ type Handle struct {
 	UnixFD   uint64          // Unix FD created by create/open syscall
 	OptCnt   uint64          // Number of operations done on this file
 	Flags    common.BitMap64 // Various states of the file
-	Path     string          // Always holds path relative to mount dir
+	Path     string          // Current path relative to mount dir; updated by the namespace registry when the object is renamed
 	values   map[string]any  // Map to hold other info if application wants to store
+
+	// Object identity assigned by the namespace registry. NameGen is the naming
+	// generation of Path captured when the handle was bound. Both are protected
+	// by the handle's RWMutex. A zero ObjectID means the handle is not tracked
+	// and Path is the only source of truth (legacy behaviour).
+	ObjID   ObjectID
+	NameGen uint64
+}
+
+// BindIdentity records the object identity and naming generation of the object
+// this handle refers to. Callers must hold the handle's write lock (or call
+// before the handle is published to other goroutines).
+func (handle *Handle) BindIdentity(id ObjectID, gen uint64) {
+	handle.ObjID = id
+	handle.NameGen = gen
+}
+
+// Identity returns the bound object identity and the naming generation captured
+// at bind time. Safe for concurrent use under the handle's RWMutex.
+func (handle *Handle) Identity() (ObjectID, uint64) {
+	return handle.ObjID, handle.NameGen
+}
+
+// Rebind updates the current path and naming generation of the handle after the
+// object has been renamed. Its immutable ObjectID does not change. Callers must
+// hold the handle's write lock.
+func (handle *Handle) Rebind(path string, gen uint64) {
+	handle.Path = path
+	handle.NameGen = gen
 }
 
 func NewHandle(path string) *Handle {

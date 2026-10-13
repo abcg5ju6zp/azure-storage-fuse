@@ -1454,3 +1454,52 @@ func (n *attrCacheNoopNext) GetAttr(_ internal.GetAttrOptions) (*internal.ObjAtt
 func TestSweeperTestSuite(t *testing.T) {
 	suite.Run(t, new(sweeperTestSuite))
 }
+
+// TestGetAttrBypassCache forces a remote fetch even when a fresh entry is
+// cached, and writes the fresh result back into the cache. This is the probe
+// path used to reconcile uncertain rename/delete responses.
+func (suite *attrCacheTestSuite) TestGetAttrBypassCache() {
+	defer suite.cleanupTest()
+	path := "bypass1"
+
+	// Seed a positive cache entry through a normal fetch.
+	first := internal.GetAttrOptions{Name: path}
+	suite.mock.EXPECT().GetAttr(first).Return(getPathAttr(path, defaultSize, fs.FileMode(defaultMode), false), nil)
+	attr1, err := suite.attrCache.GetAttr(first)
+	suite.assert.NoError(err)
+
+	// A normal lookup is served from cache (no mock expectation).
+	_, err = suite.attrCache.GetAttr(internal.GetAttrOptions{Name: path})
+	suite.assert.NoError(err)
+
+	// Bypass must hit the next component even though the entry is fresh, and
+	// return the new attributes.
+	bypass := internal.GetAttrOptions{Name: path, BypassCache: true}
+	newAttr := getPathAttr(path, defaultSize+1, fs.FileMode(defaultMode), false)
+	suite.mock.EXPECT().GetAttr(bypass).Return(newAttr, nil)
+	attr2, err := suite.attrCache.GetAttr(bypass)
+	suite.assert.NoError(err)
+	suite.assert.Equal(defaultSize+1, attr2.Size)
+	suite.assert.NotEqual(attr1.Size, attr2.Size)
+
+	// The cache now holds the refreshed value.
+	cached, ok := suite.attrCache.lru.Peek(path)
+	suite.assert.True(ok)
+	suite.assert.Equal(defaultSize+1, cached.attr.Size)
+
+	// Bypass also overrides a negative entry: cache ENOENT, probe returns the
+	// object, subsequent normal lookup sees it.
+	negPath := "bypass2"
+	negOpts := internal.GetAttrOptions{Name: negPath, BypassCache: true}
+	suite.mock.EXPECT().GetAttr(negOpts).Return(&internal.ObjAttr{}, syscall.ENOENT)
+	_, err = suite.attrCache.GetAttr(negOpts)
+	suite.assert.Equal(syscall.ENOENT, err)
+
+	posOpts := internal.GetAttrOptions{Name: negPath, BypassCache: true}
+	suite.mock.EXPECT().GetAttr(posOpts).Return(getPathAttr(negPath, defaultSize, fs.FileMode(defaultMode), false), nil)
+	_, err = suite.attrCache.GetAttr(posOpts)
+	suite.assert.NoError(err)
+
+	_, err = suite.attrCache.GetAttr(internal.GetAttrOptions{Name: negPath})
+	suite.assert.NoError(err, "negative entry must be replaced by the bypassed positive probe")
+}

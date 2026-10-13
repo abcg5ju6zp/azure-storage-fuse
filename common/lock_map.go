@@ -70,6 +70,19 @@ func (l *LockMap) Delete(name string) {
 	l.locks.Delete(name)
 }
 
+// TransferHandleCount moves all open-handle counts from src to dst. It must be
+// called while holding both lock items exclusively, so that Inc/Dec from
+// OpenFile/ReleaseFile cannot interleave with the rename commit. Returns the
+// number of handles transferred.
+func (l *LockMap) TransferHandleCount(src, dst string) uint32 {
+	srcItem := l.Get(src)
+	dstItem := l.Get(dst)
+	count := srcItem.Count()
+	dstItem.AddCount(count)
+	srcItem.SetCount(0)
+	return count
+}
+
 // Check if this file is already exLocked or not
 func (l *LockMap) Locked(name string) bool {
 	lockIntf, ok := l.locks.Load(name)
@@ -116,6 +129,19 @@ func (l *LockMapItem) Dec() {
 // Get the current handle count
 func (l *LockMapItem) Count() uint32 {
 	return l.handleCount
+}
+
+// SetCount overwrites the handle count. It is used together with AddCount when
+// open handles migrate from one name to another during a rename commit.
+func (l *LockMapItem) SetCount(count uint32) {
+	l.handleCount = count
+}
+
+// AddCount adds a (possibly negative) delta to the handle count. Used when a
+// rename commits: open handles counted against the source name are transferred
+// to the destination name.
+func (l *LockMapItem) AddCount(delta uint32) {
+	l.handleCount += delta
 }
 
 // Set the download time of the file

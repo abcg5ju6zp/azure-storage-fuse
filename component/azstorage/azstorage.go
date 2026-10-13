@@ -58,9 +58,16 @@ type AzStorage struct {
 	stConfig    AzStorageConfig
 	startTime   time.Time
 	listBlocked bool
+
+	// cpkMigrator runs the restart-safe background key rotation migration.
+	cpkMigrator *cpkMigrator
 }
 
 const compName = "azstorage"
+
+// cpkBindTokenKey stores the key-ring binding token on an open handle so
+// ReleaseFile can unpin the key version the handle was opened with.
+const cpkBindTokenKey = "cpk-bind-token"
 
 // Verification to check satisfaction criteria with Component Interface
 var _ internal.Component = &AzStorage{}
@@ -142,8 +149,29 @@ func (az *AzStorage) OnConfigChange() {
 		return
 	}
 
+	// A config hot-reload may have rotated the CPK active key: make sure the
+	// migration loop is attached to the (possibly new) connection and running.
+	if az.stConfig.cpk != nil && az.stConfig.cpk.Enabled() {
+		if backend, ok := az.storage.(cpkRemoteBackend); ok {
+			az.stConfig.cpk.SetResolver(backend)
+			if az.cpkMigrator == nil {
+				az.cpkMigrator = newCPKMigrator(az.stConfig.cpk, backend, az.stConfig.cpkMigrationInterval, 0)
+			}
+			az.startCPKMigratorIfNeeded()
+		}
+	}
+
 	// dynamic update of the sdk log listener
 	setSDKLogListener()
+}
+
+// CPKRotationStatus returns the queryable progress of the customer-provided key
+// rotation. It is empty/disabled for mounts without CPK.
+func (az *AzStorage) CPKRotationStatus() CPKStatusSnapshot {
+	if az.stConfig.cpk == nil {
+		return CPKStatusSnapshot{Enabled: false, Phase: cpkPhaseStable}
+	}
+	return az.stConfig.cpk.Status()
 }
 
 func (az *AzStorage) configureAndTest(isParent bool) error {
@@ -178,7 +206,47 @@ func (az *AzStorage) configureAndTest(isParent bool) error {
 		}
 	}
 
+	az.configureCPKRotation()
 	return nil
+}
+
+// configureCPKRotation attaches the remote backend to the key ring, reconciles
+// an interrupted rotation after restart and prepares the background migrator.
+// The migrator loop itself is started from Start (the mounted child runs Start).
+func (az *AzStorage) configureCPKRotation() {
+	mgr := az.stConfig.cpk
+	if mgr == nil || !mgr.Enabled() {
+		return
+	}
+	backend, ok := az.storage.(cpkRemoteBackend)
+	if !ok {
+		return
+	}
+	mgr.SetResolver(backend)
+
+	if prober, ok := az.storage.(cpkKeyProber); ok {
+		if rotated, err := mgr.StartupReconcile(az.stConfig.cpkKeys, prober); err != nil {
+			log.Crit("AzStorage::configureCPKRotation : rotation resume failed, new writes may be paused [%s]", err.Error())
+		} else if rotated {
+			log.Crit("AzStorage::configureCPKRotation : resumed pending CPK rotation from configuration")
+		}
+	}
+
+	if az.cpkMigrator == nil {
+		az.cpkMigrator = newCPKMigrator(mgr, backend, az.stConfig.cpkMigrationInterval, 0)
+	}
+}
+
+// startCPKMigratorIfNeeded launches background migration while a rotation is
+// active and not yet complete.
+func (az *AzStorage) startCPKMigratorIfNeeded() {
+	if az.cpkMigrator == nil || az.stConfig.cpk == nil {
+		return
+	}
+	if phase := az.stConfig.cpk.Phase(); phase == cpkPhaseRotating {
+		az.cpkMigrator.start()
+		az.cpkMigrator.trigger()
+	}
 }
 
 // Start : Initialize the go-sdk pipeline here and test auth is working fine
@@ -191,12 +259,18 @@ func (az *AzStorage) Start(ctx context.Context) error {
 	// create stats collector for azstorage
 	azStatsCollector = stats_manager.NewStatsCollector(az.Name())
 
+	// Resume background migration of an active or recovered CPK rotation.
+	az.startCPKMigratorIfNeeded()
+
 	return nil
 }
 
 // Stop : Disconnect all running operations here
 func (az *AzStorage) Stop() error {
 	log.Trace("AzStorage::Stop : Stopping component %s", az.Name())
+	if az.cpkMigrator != nil {
+		az.cpkMigrator.stop()
+	}
 	azStatsCollector.Destroy()
 	return nil
 }
@@ -379,6 +453,11 @@ func (az *AzStorage) CreateFile(options internal.CreateFileOptions) (*handlemap.
 	if err != nil {
 		return nil, err
 	}
+	// Pin the new file version to the active key for its whole lifetime.
+	if mgr := az.stConfig.cpk; mgr != nil && mgr.Enabled() {
+		token := mgr.BindHandle(options.Name, mgr.ActiveSHA())
+		handle.SetValue(cpkBindTokenKey, token)
+	}
 	handle.Mtime = time.Now()
 
 	azStatsCollector.PushEvents(createFile, options.Name, map[string]any{mode: options.Mode.String()})
@@ -408,6 +487,14 @@ func (az *AzStorage) OpenFile(options internal.OpenFileOptions) (*handlemap.Hand
 	handle.Size = int64(attr.Size)
 	handle.Mtime = attr.Mtime
 
+	// Pin this open version to the key identity the object was observed with,
+	// so reads, cached blocks and random/flush writes keep using that key until
+	// the version completes on close even if a rotation happens meanwhile.
+	if mgr := az.stConfig.cpk; mgr != nil && mgr.Enabled() {
+		token := mgr.BindHandle(options.Name, attr.EncryptionKeySHA)
+		handle.SetValue(cpkBindTokenKey, token)
+	}
+
 	// increment open file handles count
 	azStatsCollector.UpdateStats(stats_manager.Increment, openHandles, (int64)(1))
 
@@ -416,6 +503,18 @@ func (az *AzStorage) OpenFile(options internal.OpenFileOptions) (*handlemap.Hand
 
 func (az *AzStorage) ReleaseFile(options internal.ReleaseFileOptions) error {
 	log.Trace("AzStorage::ReleaseFile : %s", options.Handle.Path)
+
+	// Unpin the key version bound to this open handle. Once all handles on an
+	// old-key object close, the object can be migrated and the old key can
+	// eventually be reported revocable.
+	if mgr := az.stConfig.cpk; mgr != nil && mgr.Enabled() {
+		if tv, ok := options.Handle.GetValue(cpkBindTokenKey); ok {
+			if token, ok := tv.(uint64); ok {
+				mgr.ReleaseHandle(token)
+			}
+		}
+		options.Handle.RemoveValue(cpkBindTokenKey)
+	}
 
 	// decrement open file handles count
 	azStatsCollector.UpdateStats(stats_manager.Decrement, openHandles, (int64)(1))

@@ -124,6 +124,92 @@ func (dl *Datalake) UpdateConfig(cfg AzStorageConfig) error {
 	return dl.BlockBlob.UpdateConfig(cfg)
 }
 
+// fileCPKForRead selects the DFS CPK option for an existing object based on its
+// remote encryption identifier.
+func (dl *Datalake) fileCPKForRead(name string) (*file.CPKInfo, error) {
+	m := dl.Config.cpk
+	if m == nil || !m.Enabled() {
+		return dl.datalakeCPKOpt, nil
+	}
+	k, err := m.ReadKey(name)
+	if err != nil {
+		return nil, mapCPKSelectionErr(err)
+	}
+	return m.FileCPKInfo(k.material.sha), nil
+}
+
+// fileCPKForNew selects the DFS CPK option for new objects (paused while the new
+// key is not validated).
+func (dl *Datalake) fileCPKForNew() (*file.CPKInfo, error) {
+	m := dl.Config.cpk
+	if m == nil || !m.Enabled() {
+		return dl.datalakeCPKOpt, nil
+	}
+	k, err := m.NewObjectKey()
+	if err != nil {
+		return nil, mapCPKSelectionErr(err)
+	}
+	return m.FileCPKInfo(k.material.sha), nil
+}
+
+// fileCPKForSHA selects the DFS CPK option for a specific remote key sha.
+func (dl *Datalake) fileCPKForSHA(sha string) (*file.CPKInfo, error) {
+	m := dl.Config.cpk
+	if m == nil || !m.Enabled() {
+		return dl.datalakeCPKOpt, nil
+	}
+	if _, err := m.KeyForSHA(sha); err != nil {
+		return nil, mapCPKSelectionErr(err)
+	}
+	return m.FileCPKInfo(sha), nil
+}
+
+// resolveFileAttrCPK picks the key for a DFS GetProperties call and returns the
+// remote sha to stamp on the attribute.
+func (dl *Datalake) resolveFileAttrCPK(name, forcedSHA string) (*file.CPKInfo, string, error) {
+	m := dl.Config.cpk
+	if m == nil || !m.Enabled() {
+		return dl.datalakeCPKOpt, "", nil
+	}
+	if forcedSHA != "" {
+		opt, err := dl.fileCPKForSHA(forcedSHA)
+		return opt, forcedSHA, err
+	}
+	if m.SingleKeyMode() {
+		return dl.datalakeCPKOpt, "", nil
+	}
+	sha, _, err := m.resolveIdentity(name)
+	if err != nil {
+		return nil, "", mapCPKSelectionErr(err)
+	}
+	if sha == "" {
+		return m.FileCPKInfo(m.ActiveSHA()), "", nil
+	}
+	k, err := m.KeyForSHA(sha)
+	if err != nil {
+		return nil, "", mapCPKSelectionErr(err)
+	}
+	return m.FileCPKInfo(k.material.sha), sha, nil
+}
+
+// CPK rotation backend operations are served by the embedded blob client, which
+// talks to the blob endpoint of the same HNS account.
+func (dl *Datalake) remoteIdentity(name string) (string, string, error) {
+	return dl.BlockBlob.remoteIdentity(name)
+}
+
+func (dl *Datalake) enumerateCPKObjects() ([]cpkRemoteObject, error) {
+	return dl.BlockBlob.enumerateCPKObjects()
+}
+
+func (dl *Datalake) migrateObject(obj cpkRemoteObject, newSHA, srcETag string) (string, error) {
+	return dl.BlockBlob.migrateObject(obj, newSHA, srcETag)
+}
+
+func (dl *Datalake) probeCPKKey(material cpkKeyMaterial) error {
+	return dl.BlockBlob.probeCPKKey(material)
+}
+
 // UpdateServiceClient : Update the SAS specified by the user and create new service client
 func (dl *Datalake) UpdateServiceClient(key, value string) (err error) {
 	if key == "saskey" {
@@ -292,9 +378,14 @@ func (dl *Datalake) CreateFile(name string, mode os.FileMode) error {
 func (dl *Datalake) CreateDirectory(name string) error {
 	log.Trace("Datalake::CreateDirectory : name %s", name)
 
+	cpkOpt, err := dl.fileCPKForNew()
+	if err != nil {
+		return err
+	}
+
 	directoryURL := dl.Filesystem.NewDirectoryClient(filepath.Join(dl.Config.prefixPath, name))
-	_, err := directoryURL.Create(context.Background(), &directory.CreateOptions{
-		CPKInfo: dl.datalakeCPKOpt,
+	_, err = directoryURL.Create(context.Background(), &directory.CreateOptions{
+		CPKInfo: cpkOpt,
 		AccessConditions: &directory.AccessConditions{
 			ModifiedAccessConditions: &directory.ModifiedAccessConditions{
 				IfNoneMatch: to.Ptr(azcore.ETagAny),
@@ -352,6 +443,9 @@ func (dl *Datalake) DeleteFile(name string) (err error) {
 		}
 	}
 
+	if m := dl.Config.cpk; m != nil && m.Enabled() {
+		m.NotifyDeleted(name)
+	}
 	return nil
 }
 
@@ -382,10 +476,15 @@ func (dl *Datalake) DeleteDirectory(name string) (err error) {
 func (dl *Datalake) RenameFile(source string, target string, srcAttr *internal.ObjAttr) error {
 	log.Trace("Datalake::RenameFile : %s -> %s", source, target)
 
+	cpkOpt, err := dl.fileCPKForRead(source)
+	if err != nil {
+		return err
+	}
+
 	fileClient := dl.Filesystem.NewFileClient(url.PathEscape(filepath.Join(dl.Config.prefixPath, source)))
 
 	renameResponse, err := fileClient.Rename(context.Background(), filepath.Join(dl.Config.prefixPath, target), &file.RenameOptions{
-		CPKInfo: dl.datalakeCPKOpt,
+		CPKInfo: cpkOpt,
 	})
 	if err != nil {
 		serr := storeDatalakeErrToErr(err)
@@ -398,6 +497,16 @@ func (dl *Datalake) RenameFile(source string, target string, srcAttr *internal.O
 		}
 	}
 	modifyLMTandEtag(srcAttr, renameResponse.LastModified, sanitizeEtag(renameResponse.ETag))
+
+	// HNS rename is a namespace operation and preserves the object's encryption
+	// key; move the local bindings/journal and then reconfirm the destination
+	// encryption identifier from the service.
+	if m := dl.Config.cpk; m != nil && m.Enabled() {
+		m.NotifyRenamed(source, target)
+		if sha, etag, ierr := dl.remoteIdentity(target); ierr == nil {
+			m.RecordRemoteIdentity(target, sha, etag)
+		}
+	}
 	return nil
 }
 
@@ -405,9 +514,14 @@ func (dl *Datalake) RenameFile(source string, target string, srcAttr *internal.O
 func (dl *Datalake) RenameDirectory(source string, target string) error {
 	log.Trace("Datalake::RenameDirectory : %s -> %s", source, target)
 
+	cpkOpt, err := dl.fileCPKForRead(source)
+	if err != nil {
+		return err
+	}
+
 	directoryClient := dl.Filesystem.NewDirectoryClient(url.PathEscape(filepath.Join(dl.Config.prefixPath, source)))
-	_, err := directoryClient.Rename(context.Background(), filepath.Join(dl.Config.prefixPath, target), &directory.RenameOptions{
-		CPKInfo: dl.datalakeCPKOpt,
+	_, err = directoryClient.Rename(context.Background(), filepath.Join(dl.Config.prefixPath, target), &directory.RenameOptions{
+		CPKInfo: cpkOpt,
 	})
 	if err != nil {
 		serr := storeDatalakeErrToErr(err)
@@ -431,9 +545,14 @@ func (dl *Datalake) RenameDirectory(source string, target string) error {
 func (dl *Datalake) GetAttr(name string) (blobAttr *internal.ObjAttr, err error) {
 	log.Trace("Datalake::GetAttr : name %s", name)
 
+	cpkOpt, remoteSHA, err := dl.resolveFileAttrCPK(name, "")
+	if err != nil {
+		return blobAttr, err
+	}
+
 	fileClient := dl.Filesystem.NewFileClient(filepath.Join(dl.Config.prefixPath, name))
 	prop, err := fileClient.GetProperties(context.Background(), &file.GetPropertiesOptions{
-		CPKInfo: dl.datalakeCPKOpt,
+		CPKInfo: cpkOpt,
 	})
 	if err != nil {
 		e := storeDatalakeErrToErr(err)
@@ -471,6 +590,11 @@ func (dl *Datalake) GetAttr(name string) (blobAttr *internal.ObjAttr, err error)
 		ETag:   sanitizeEtag(prop.ETag),
 	}
 	parseMetadata(blobAttr, prop.Metadata)
+
+	if m := dl.Config.cpk; m != nil && m.Enabled() {
+		blobAttr.EncryptionKeySHA = remoteSHA
+		m.RecordRemoteIdentity(name, remoteSHA, blobAttr.ETag)
+	}
 
 	if *prop.ResourceType == "directory" {
 		blobAttr.Flags = internal.NewDirBitMap()

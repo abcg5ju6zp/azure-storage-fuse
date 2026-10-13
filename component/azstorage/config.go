@@ -38,8 +38,10 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
+	"github.com/Azure/azure-storage-fuse/v2/common"
 	"github.com/Azure/azure-storage-fuse/v2/common/config"
 	"github.com/Azure/azure-storage-fuse/v2/common/log"
 	"github.com/vibhansa-msft/blobfilter"
@@ -148,55 +150,69 @@ const (
 	EnvAzAuthResource                    = "AZURE_STORAGE_AUTH_RESOURCE"
 	EnvAzStorageCpkEncryptionKey         = "AZURE_STORAGE_CPK_ENCRYPTION_KEY"
 	EnvAzStorageCpkEncryptionKeySha256   = "AZURE_STORAGE_CPK_ENCRYPTION_KEY_SHA256"
+	EnvAzStorageCpkStatePath             = "AZURE_STORAGE_CPK_STATE_PATH"
 	EnvAzUserAssertion                   = "AZURE_STORAGE_USER_ASSERTION"
 )
 
+// CPKKeyOptions is one entry of the ordered customer-provided key ring. The
+// first entry is the active key used for new objects; the following entries are
+// retained keys that existing remote objects (and open file versions) may still
+// be encrypted with during and after a rotation.
+type CPKKeyOptions struct {
+	Key       string `config:"key" yaml:"key"`
+	KeySha256 string `config:"key-sha256" yaml:"key-sha256"`
+}
+
 type AzStorageOptions struct {
-	AccountType             string `config:"type" yaml:"type,omitempty"`
-	UseHTTP                 bool   `config:"use-http" yaml:"use-http,omitempty"`
-	AccountName             string `config:"account-name" yaml:"account-name,omitempty"`
-	AccountKey              string `config:"account-key" yaml:"account-key,omitempty"`
-	SaSKey                  string `config:"sas" yaml:"sas,omitempty"`
-	ApplicationID           string `config:"appid" yaml:"appid,omitempty"`
-	ResourceID              string `config:"resid" yaml:"resid,omitempty"`
-	ObjectID                string `config:"objid" yaml:"objid,omitempty"`
-	TenantID                string `config:"tenantid" yaml:"tenantid,omitempty"`
-	ClientID                string `config:"clientid" yaml:"clientid,omitempty"`
-	ClientSecret            string `config:"clientsecret" yaml:"clientsecret,omitempty"`
-	OAuthTokenFilePath      string `config:"oauth-token-path" yaml:"oauth-token-path,omitempty"`
-	WorkloadIdentityToken   string `config:"workload-identity-token" yaml:"workload-identity-token,omitempty"`
-	ActiveDirectoryEndpoint string `config:"aadendpoint" yaml:"aadendpoint,omitempty"`
-	Endpoint                string `config:"endpoint" yaml:"endpoint,omitempty"`
-	AuthMode                string `config:"mode" yaml:"mode,omitempty"`
-	Container               string `config:"container" yaml:"container,omitempty"`
-	PrefixPath              string `config:"subdirectory" yaml:"subdirectory,omitempty"`
-	BlockSize               int64  `config:"block-size-mb" yaml:"block-size-mb,omitempty"`
-	MaxConcurrency          uint16 `config:"max-concurrency" yaml:"max-concurrency,omitempty"`
-	DefaultTier             string `config:"tier" yaml:"tier,omitempty"`
-	CancelListForSeconds    uint16 `config:"block-list-on-mount-sec" yaml:"block-list-on-mount-sec,omitempty"`
-	MaxRetries              int32  `config:"max-retries" yaml:"max-retries,omitempty"`
-	MaxTimeout              int32  `config:"max-retry-timeout-sec" yaml:"max-retry-timeout-sec,omitempty"`
-	BackoffTime             int32  `config:"retry-backoff-sec" yaml:"retry-backoff-sec,omitempty"`
-	MaxRetryDelay           int32  `config:"max-retry-delay-sec" yaml:"max-retry-delay-sec,omitempty"`
-	HttpProxyAddress        string `config:"http-proxy" yaml:"http-proxy,omitempty"`
-	HttpsProxyAddress       string `config:"https-proxy" yaml:"https-proxy,omitempty"`
-	FailUnsupportedOp       bool   `config:"fail-unsupported-op" yaml:"fail-unsupported-op,omitempty"`
-	AuthResourceString      string `config:"auth-resource" yaml:"auth-resource,omitempty"`
-	UpdateMD5               bool   `config:"update-md5" yaml:"update-md5"`
-	ValidateMD5             bool   `config:"validate-md5" yaml:"validate-md5"`
-	VirtualDirectory        bool   `config:"virtual-directory" yaml:"virtual-directory"`
-	MaxResultsForList       int32  `config:"max-results-for-list" yaml:"max-results-for-list"`
-	DisableCompression      bool   `config:"disable-compression" yaml:"disable-compression"`
-	Telemetry               string `config:"telemetry" yaml:"telemetry"`
-	HonourACL               bool   `config:"honour-acl" yaml:"honour-acl"`
-	CPKEnabled              bool   `config:"cpk-enabled" yaml:"cpk-enabled"`
-	CPKEncryptionKey        string `config:"cpk-encryption-key" yaml:"cpk-encryption-key"`
-	CPKEncryptionKeySha256  string `config:"cpk-encryption-key-sha256" yaml:"cpk-encryption-key-sha256"`
-	PreserveACL             bool   `config:"preserve-acl" yaml:"preserve-acl"`
-	Filter                  string `config:"filter" yaml:"filter"`
-	UserAssertion           string `config:"user-assertion" yaml:"user-assertions"`
-	CapMbpsRead             int64  `config:"cap-mbps-read" yaml:"cap-mbps-read"`
-	CapIOps                 int64  `config:"cap-iops" yaml:"cap-iops"`
+	AccountType             string          `config:"type" yaml:"type,omitempty"`
+	UseHTTP                 bool            `config:"use-http" yaml:"use-http,omitempty"`
+	AccountName             string          `config:"account-name" yaml:"account-name,omitempty"`
+	AccountKey              string          `config:"account-key" yaml:"account-key,omitempty"`
+	SaSKey                  string          `config:"sas" yaml:"sas,omitempty"`
+	ApplicationID           string          `config:"appid" yaml:"appid,omitempty"`
+	ResourceID              string          `config:"resid" yaml:"resid,omitempty"`
+	ObjectID                string          `config:"objid" yaml:"objid,omitempty"`
+	TenantID                string          `config:"tenantid" yaml:"tenantid,omitempty"`
+	ClientID                string          `config:"clientid" yaml:"clientid,omitempty"`
+	ClientSecret            string          `config:"clientsecret" yaml:"clientsecret,omitempty"`
+	OAuthTokenFilePath      string          `config:"oauth-token-path" yaml:"oauth-token-path,omitempty"`
+	WorkloadIdentityToken   string          `config:"workload-identity-token" yaml:"workload-identity-token,omitempty"`
+	ActiveDirectoryEndpoint string          `config:"aadendpoint" yaml:"aadendpoint,omitempty"`
+	Endpoint                string          `config:"endpoint" yaml:"endpoint,omitempty"`
+	AuthMode                string          `config:"mode" yaml:"mode,omitempty"`
+	Container               string          `config:"container" yaml:"container,omitempty"`
+	PrefixPath              string          `config:"subdirectory" yaml:"subdirectory,omitempty"`
+	BlockSize               int64           `config:"block-size-mb" yaml:"block-size-mb,omitempty"`
+	MaxConcurrency          uint16          `config:"max-concurrency" yaml:"max-concurrency,omitempty"`
+	DefaultTier             string          `config:"tier" yaml:"tier,omitempty"`
+	CancelListForSeconds    uint16          `config:"block-list-on-mount-sec" yaml:"block-list-on-mount-sec,omitempty"`
+	MaxRetries              int32           `config:"max-retries" yaml:"max-retries,omitempty"`
+	MaxTimeout              int32           `config:"max-retry-timeout-sec" yaml:"max-retry-timeout-sec,omitempty"`
+	BackoffTime             int32           `config:"retry-backoff-sec" yaml:"retry-backoff-sec,omitempty"`
+	MaxRetryDelay           int32           `config:"max-retry-delay-sec" yaml:"max-retry-delay-sec,omitempty"`
+	HttpProxyAddress        string          `config:"http-proxy" yaml:"http-proxy,omitempty"`
+	HttpsProxyAddress       string          `config:"https-proxy" yaml:"https-proxy,omitempty"`
+	FailUnsupportedOp       bool            `config:"fail-unsupported-op" yaml:"fail-unsupported-op,omitempty"`
+	AuthResourceString      string          `config:"auth-resource" yaml:"auth-resource,omitempty"`
+	UpdateMD5               bool            `config:"update-md5" yaml:"update-md5"`
+	ValidateMD5             bool            `config:"validate-md5" yaml:"validate-md5"`
+	VirtualDirectory        bool            `config:"virtual-directory" yaml:"virtual-directory"`
+	MaxResultsForList       int32           `config:"max-results-for-list" yaml:"max-results-for-list"`
+	DisableCompression      bool            `config:"disable-compression" yaml:"disable-compression"`
+	Telemetry               string          `config:"telemetry" yaml:"telemetry"`
+	HonourACL               bool            `config:"honour-acl" yaml:"honour-acl"`
+	CPKEnabled              bool            `config:"cpk-enabled" yaml:"cpk-enabled"`
+	CPKEncryptionKey        string          `config:"cpk-encryption-key" yaml:"cpk-encryption-key"`
+	CPKEncryptionKeySha256  string          `config:"cpk-encryption-key-sha256" yaml:"cpk-encryption-key-sha256"`
+	CPKEncryptionKeys       []CPKKeyOptions `config:"cpk-encryption-keys" yaml:"cpk-encryption-keys,omitempty"`
+	CPKStatePath            string          `config:"cpk-state-path" yaml:"cpk-state-path,omitempty"`
+	CPKIdentityTTLSeconds   int32           `config:"cpk-identity-ttl-sec" yaml:"cpk-identity-ttl-sec,omitempty"`
+	CPKMigrateIntervalSecs  int32           `config:"cpk-migration-interval-sec" yaml:"cpk-migration-interval-sec,omitempty"`
+	PreserveACL             bool            `config:"preserve-acl" yaml:"preserve-acl"`
+	Filter                  string          `config:"filter" yaml:"filter"`
+	UserAssertion           string          `config:"user-assertion" yaml:"user-assertions"`
+	CapMbpsRead             int64           `config:"cap-mbps-read" yaml:"cap-mbps-read"`
+	CapIOps                 int64           `config:"cap-iops" yaml:"cap-iops"`
 	// Skip the proactive Blob/DFS authentication-validation REST calls made during mount.
 	// Authentication itself is unchanged. Default false.
 	SkipMountValidation bool `config:"skip-mount-validation" yaml:"skip-mount-validation,omitempty"`
@@ -240,6 +256,7 @@ func RegisterEnvVariables() {
 
 	config.BindEnv("azstorage.cpk-encryption-key", EnvAzStorageCpkEncryptionKey)
 	config.BindEnv("azstorage.cpk-encryption-key-sha256", EnvAzStorageCpkEncryptionKeySha256)
+	config.BindEnv("azstorage.cpk-state-path", EnvAzStorageCpkStatePath)
 
 	config.BindEnv("azstorage.user-assertion", EnvAzUserAssertion)
 }
@@ -370,15 +387,8 @@ func ParseAndValidateConfig(az *AzStorage, opt AzStorageOptions) error {
 		opt.UseHTTP = !opt.UseHTTPS
 	}
 
-	if opt.CPKEnabled {
-		if opt.CPKEncryptionKey == "" || opt.CPKEncryptionKeySha256 == "" {
-			log.Err("ParseAndValidateConfig : CPK key or CPK key sha256 not provided")
-			return errors.New("CPK key or key sha256 not provided")
-		}
-		az.stConfig.cpkEnabled = opt.CPKEnabled
-		az.stConfig.cpkEncryptionKey = opt.CPKEncryptionKey
-		az.stConfig.cpkEncryptionKeySha256 = opt.CPKEncryptionKeySha256
-	}
+	// CPK key ring configuration is applied in ParseAndReadDynamicConfig, which
+	// runs below for the initial mount and again on every config hot-reload.
 
 	// Validate endpoint
 	if opt.Endpoint == "" {
@@ -599,6 +609,12 @@ func filterReferencesTag(filter string) bool {
 func ParseAndReadDynamicConfig(az *AzStorage, opt AzStorageOptions, reload bool) error {
 	log.Trace("ParseAndReadDynamicConfig : Reparsing config")
 
+	// CPK key ring / rotation configuration. On reload this is where an active
+	// key change is validated and turned into a rotation without unmounting.
+	if err := configureCPK(az, opt, reload); err != nil {
+		return err
+	}
+
 	// If block size and max concurrency is configured use those
 	// A user provided value of 0 doesn't make sense for BlockSize, or MaxConcurrency.
 	if opt.BlockSize != 0 {
@@ -676,5 +692,113 @@ func ParseAndReadDynamicConfig(az *AzStorage, opt AzStorageOptions, reload bool)
 		az.stConfig.capIOps = opt.CapIOps
 	}
 
+	return nil
+}
+
+const (
+	defaultCPKIdentityTTLSeconds  int32 = 30
+	defaultCPKMigrateIntervalSecs int32 = 30
+)
+
+// buildCPKMaterials converts the user configuration into the ordered key ring,
+// accepting either the legacy single cpk-encryption-key pair or the multi-key
+// cpk-encryption-keys list, and validates every key locally.
+func buildCPKMaterials(opt AzStorageOptions) ([]cpkKeyMaterial, error) {
+	if len(opt.CPKEncryptionKeys) > 0 {
+		materials := make([]cpkKeyMaterial, 0, len(opt.CPKEncryptionKeys))
+		for i, entry := range opt.CPKEncryptionKeys {
+			if entry.Key == "" || entry.KeySha256 == "" {
+				return nil, fmt.Errorf("cpk-encryption-keys[%d]: key and key-sha256 are required", i)
+			}
+			if err := ValidateCPKMaterial(entry.Key, entry.KeySha256); err != nil {
+				return nil, fmt.Errorf("cpk-encryption-keys[%d]: %w", i, err)
+			}
+			materials = append(materials, cpkKeyMaterial{key: entry.Key, sha: entry.KeySha256})
+		}
+		return materials, nil
+	}
+
+	if opt.CPKEncryptionKey == "" || opt.CPKEncryptionKeySha256 == "" {
+		return nil, errors.New("CPK key or key sha256 not provided")
+	}
+	if err := ValidateCPKMaterial(opt.CPKEncryptionKey, opt.CPKEncryptionKeySha256); err != nil {
+		return nil, err
+	}
+	return []cpkKeyMaterial{{key: opt.CPKEncryptionKey, sha: opt.CPKEncryptionKeySha256}}, nil
+}
+
+// configureCPK builds the key ring on initial mount and reconciles it on config
+// reload. A failing new-key validation never tears the mount down: old keys keep
+// serving reads while new writes are paused (see cpk_ring.go).
+func configureCPK(az *AzStorage, opt AzStorageOptions, reload bool) error {
+	if !opt.CPKEnabled {
+		return nil
+	}
+
+	materials, err := buildCPKMaterials(opt)
+	if err != nil {
+		log.Err("configureCPK : invalid CPK configuration [%s]", err.Error())
+		return err
+	}
+
+	identityTTL := time.Duration(defaultCPKIdentityTTLSeconds) * time.Second
+	if opt.CPKIdentityTTLSeconds > 0 {
+		identityTTL = time.Duration(opt.CPKIdentityTTLSeconds) * time.Second
+	}
+	migrateInterval := time.Duration(defaultCPKMigrateIntervalSecs) * time.Second
+	if opt.CPKMigrateIntervalSecs > 0 {
+		migrateInterval = time.Duration(opt.CPKMigrateIntervalSecs) * time.Second
+	}
+
+	statePath := common.ExpandPath(common.DefaultWorkDir)
+	if opt.CPKStatePath != "" {
+		statePath = common.ExpandPath(opt.CPKStatePath)
+	}
+	scope := az.stConfig.authConfig.AccountName
+	if az.stConfig.container != "" {
+		scope += "-" + az.stConfig.container
+	}
+
+	// Keep the legacy static fields pointing at the active key for paths that
+	// still read them directly.
+	az.stConfig.cpkEnabled = true
+	az.stConfig.cpkEncryptionKey = materials[0].key
+	az.stConfig.cpkEncryptionKeySha256 = materials[0].sha
+	az.stConfig.cpkKeys = materials
+	az.stConfig.cpkStatePath = statePath
+	az.stConfig.cpkIdentityTTL = identityTTL
+	az.stConfig.cpkMigrationInterval = migrateInterval
+
+	if az.stConfig.cpk == nil {
+		mgr, merr := newCPKManager(cpkManagerConfig{
+			enabled:     true,
+			scope:       scope,
+			statePath:   statePath,
+			identityTTL: identityTTL,
+			keys:        materials,
+		})
+		if merr != nil {
+			log.Err("configureCPK : failed to initialise CPK key ring [%s]", merr.Error())
+			return merr
+		}
+		az.stConfig.cpk = mgr
+		log.Crit("configureCPK : CPK key ring initialised with %d key(s), active key %s, state file %s",
+			len(materials), materials[0].sha, cpkJournalFileName(statePath, scope))
+		return nil
+	}
+
+	if reload {
+		var prober cpkKeyProber
+		if az.storage != nil {
+			prober, _ = az.storage.(cpkKeyProber)
+		}
+		_, rerr := az.stConfig.cpk.ApplyConfiguredKeys(materials, prober)
+		if rerr != nil {
+			// Keep the mount alive: reads continue with retained keys, new
+			// writes are paused until a config update supplies a valid key.
+			log.Crit("configureCPK : CPK rotation not applied, new writes paused [%s]", rerr.Error())
+			return nil
+		}
+	}
 	return nil
 }

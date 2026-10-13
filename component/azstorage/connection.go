@@ -35,6 +35,7 @@ package azstorage
 
 import (
 	"os"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-storage-fuse/v2/common"
@@ -82,6 +83,21 @@ type AzStorageConfig struct {
 	cpkEnabled             bool
 	cpkEncryptionKey       string
 	cpkEncryptionKeySha256 string
+	// Ordered key ring: index 0 is the active key, later entries are retained
+	// keys that remote objects and open versions may still reference.
+	cpkKeys []cpkKeyMaterial
+	// cpk is the shared key-ring/rotation manager used by every storage call.
+	// The pointer is shared when this config struct is copied into BlockBlob
+	// and Datalake connections so both data paths share one object view.
+	cpk *CPKManager
+	// cpkStatePath is the directory holding the persistent rotation journal.
+	cpkStatePath string
+	// cpkIdentityTTL bounds reuse of a cached per-object key identity while a
+	// rotation is in progress, so cache hits re-validate against the remote
+	// encryption identifier.
+	cpkIdentityTTL time.Duration
+	// cpkMigrationInterval is the background migration sweep interval.
+	cpkMigrationInterval time.Duration
 
 	// Blob filters
 	filter       *blobfilter.BlobFilter

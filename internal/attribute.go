@@ -81,6 +81,15 @@ type ObjAttr struct {
 	MD5      []byte             // MD5 of the blob as per last GetAttr
 	ETag     string             // ETag of the blob as per last GetAttr
 	Metadata map[string]*string // extra information to preserve
+
+	// EncryptionKeySHA is the base64 SHA-256 identifier of the customer-provided
+	// key (CPK) the object is currently encrypted with, as reported by the service
+	// (x-ms-client-provided-key-sha256). It is empty for objects encrypted with
+	// the account key. During a CPK rotation every cached/listed attribute carries
+	// the key identity of the remote version it represents, so cache hits can be
+	// validated against the remote encryption identifier instead of reusing a
+	// stale key blindly.
+	EncryptionKeySHA string
 }
 
 // IsDir : Test blob is a directory or not

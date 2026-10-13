@@ -171,6 +171,21 @@ azstorage:
   cpk-enabled: true|false <enable client provided key encryption>
   cpk-encryption-key: <customer provided base64-encoded AES-256 encryption key value>
   cpk-encryption-key-sha256:  <customer provided base64-encoded sha256 of the encryption key>
+  # Online key rotation: ordered key ring. The first entry is the active key
+  # used for new objects; later entries are retained keys that existing remote
+  # objects and open file versions may still use. Rotate by editing this file
+  # (hot reload): the new first key is validated, new writes use it, old objects
+  # are migrated in the background and the old key is only reported revocable
+  # once no object or open handle references it. Rotation progress is persisted
+  # in cpk-state-path so it survives restarts.
+  cpk-encryption-keys:
+    - key: <active base64-encoded AES-256 key>
+      key-sha256: <base64-encoded sha256 of the active key>
+    - key: <retained base64-encoded AES-256 key>
+      key-sha256: <base64-encoded sha256 of the retained key>
+  cpk-state-path: <directory for the rotation state file; default: default-working-dir>
+  cpk-identity-ttl-sec: 30 <re-validate a cached object key identity against the remote encryption identifier while rotating>
+  cpk-migration-interval-sec: 30 <background migration sweep interval>
   preserve-acl: true|false <preserve ACLs and Permissions set on file during updates>
   cap-mbps-read: <Limit the throughput of downloads from your storage account. Value measured in megabits per second. Default is -1 (no limit)>
   cap-iops: <Limit the total storage operations per second. Default is -1 (no limit)>

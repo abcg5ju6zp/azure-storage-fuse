@@ -128,6 +128,112 @@ func (bb *BlockBlob) UpdateConfig(cfg AzStorageConfig) error {
 	return nil
 }
 
+// mapCPKSelectionErr converts a key-ring selection failure into the errno
+// style errors used across the storage layer: paused new writes and temporarily
+// unavailable retained keys surface as EAGAIN (retry later); an object under a
+// key this mount does not hold surfaces as EACCES.
+func mapCPKSelectionErr(err error) error {
+	switch {
+	case errors.Is(err, ErrCPKNewWritesPaused), errors.Is(err, ErrCPKKeyUnavailable):
+		return fmt.Errorf("cpk selection failed [%w] -> %w", err, syscall.EAGAIN)
+	case errors.Is(err, ErrCPKKeyNotRegistered):
+		return fmt.Errorf("cpk selection failed [%w] -> %w", err, syscall.EACCES)
+	default:
+		return err
+	}
+}
+
+// readKeyVersion selects the key version for reading/getting an existing object
+// based on its remote encryption identifier (or its pinned open version).
+func (bb *BlockBlob) readKeyVersion(name string) (*cpkKeyVersion, error) {
+	m := bb.Config.cpk
+	if m == nil || !m.Enabled() {
+		return nil, nil
+	}
+	k, err := m.ReadKey(name)
+	if err != nil {
+		return nil, mapCPKSelectionErr(err)
+	}
+	return k, nil
+}
+
+// readCPKInfo selects the SDK CPK option for a read.
+func (bb *BlockBlob) readCPKInfo(name string) (*blob.CPKInfo, error) {
+	k, err := bb.readKeyVersion(name)
+	if err != nil {
+		return nil, err
+	}
+	if k == nil {
+		return bb.blobCPKOpt, nil
+	}
+	return bb.Config.cpk.BlobCPKInfo(k.material.sha), nil
+}
+
+// writeKeyVersion selects the key for writes to an existing object. Existing
+// objects keep publishing under their current key version (Azure requires all
+// blocks of a blob to share one CPK) until migration republishes them.
+func (bb *BlockBlob) writeKeyVersion(name string) (*cpkKeyVersion, error) {
+	m := bb.Config.cpk
+	if m == nil || !m.Enabled() {
+		return nil, nil
+	}
+	k, err := m.WriteKey(name)
+	if err != nil {
+		return nil, mapCPKSelectionErr(err)
+	}
+	return k, nil
+}
+
+// writeCPKInfo selects the SDK CPK option for a write.
+func (bb *BlockBlob) writeCPKInfo(name string) (*blob.CPKInfo, error) {
+	k, err := bb.writeKeyVersion(name)
+	if err != nil {
+		return nil, err
+	}
+	if k == nil {
+		return bb.blobCPKOpt, nil
+	}
+	return bb.Config.cpk.BlobCPKInfo(k.material.sha), nil
+}
+
+// newObjectKeyVersion returns the key for brand-new objects. It fails while a
+// candidate new key has not been validated (new writes paused).
+func (bb *BlockBlob) newObjectKeyVersion() (*cpkKeyVersion, error) {
+	m := bb.Config.cpk
+	if m == nil || !m.Enabled() {
+		return nil, nil
+	}
+	k, err := m.NewObjectKey()
+	if err != nil {
+		return nil, mapCPKSelectionErr(err)
+	}
+	return k, nil
+}
+
+// newObjectCPKInfo returns the SDK CPK option for a brand-new object.
+func (bb *BlockBlob) newObjectCPKInfo() (*blob.CPKInfo, error) {
+	k, err := bb.newObjectKeyVersion()
+	if err != nil {
+		return nil, err
+	}
+	if k == nil {
+		return bb.blobCPKOpt, nil
+	}
+	return bb.Config.cpk.BlobCPKInfo(k.material.sha), nil
+}
+
+// cpkInfoForSHA returns the SDK option for a specific remote-observed key sha.
+func (bb *BlockBlob) cpkInfoForSHA(sha string) (*blob.CPKInfo, error) {
+	m := bb.Config.cpk
+	if m == nil || !m.Enabled() {
+		return bb.blobCPKOpt, nil
+	}
+	if _, err := m.KeyForSHA(sha); err != nil {
+		return nil, mapCPKSelectionErr(err)
+	}
+	return m.BlobCPKInfo(sha), nil
+}
+
 // UpdateServiceClient : Update the SAS specified by the user and create new service client
 func (bb *BlockBlob) UpdateServiceClient(key, value string) (err error) {
 	if key == "saskey" {
@@ -182,6 +288,12 @@ func (bb *BlockBlob) SetupPipeline() error {
 
 	// create the container client
 	bb.Container = bb.Service.NewContainerClient(bb.Config.container)
+
+	// The shared key ring can now resolve remote encryption identifiers and
+	// drive key validation/migration through this connection.
+	if bb.Config.cpk != nil && bb.Config.cpk.Enabled() {
+		bb.Config.cpk.SetResolver(bb)
+	}
 	return nil
 }
 
@@ -298,9 +410,13 @@ func (bb *BlockBlob) CreateFile(name string, mode os.FileMode) error {
 }
 
 func (bb *BlockBlob) createFileIfAbsent(name string) (*azcore.ETag, error) {
+	cpkOpt, err := bb.newObjectCPKInfo()
+	if err != nil {
+		return nil, err
+	}
 	etag, err := bb.uploadBuffer(name, nil, nil, &blob.AccessConditions{
 		ModifiedAccessConditions: &blob.ModifiedAccessConditions{IfNoneMatch: to.Ptr(azcore.ETagAny)},
-	})
+	}, cpkOpt)
 	if bloberror.HasCode(err, bloberror.BlobAlreadyExists, bloberror.ConditionNotMet) {
 		return nil, syscall.EEXIST
 	}
@@ -366,6 +482,11 @@ func (bb *BlockBlob) DeleteFile(name string) (err error) {
 		}
 	}
 
+	// The object no longer references any key: drop identity and journal state.
+	if m := bb.Config.cpk; m != nil && m.Enabled() {
+		m.NotifyDeleted(name)
+	}
+
 	return nil
 }
 
@@ -415,6 +536,14 @@ func (bb *BlockBlob) RenameFile(source string, target string, srcAttr *internal.
 	var dstLMT = copyResponse.LastModified
 	var dstETag = sanitizeEtag(copyResponse.ETag)
 
+	// A copy in the same account keeps the source object's encryption key, so
+	// present the source object's key identity while polling the destination.
+	copyCPK, cpkErr := bb.readCPKInfo(source)
+	if cpkErr != nil {
+		log.Err("BlockBlob::RenameFile : Failed to select key for %s [%s]", source, cpkErr.Error())
+		return cpkErr
+	}
+
 	copyStatus := copyResponse.CopyStatus
 	var prop blob.GetPropertiesResponse
 	pollCnt := 0
@@ -422,7 +551,7 @@ func (bb *BlockBlob) RenameFile(source string, target string, srcAttr *internal.
 		time.Sleep(time.Second * 1)
 		pollCnt++
 		prop, err = newBlobClient.GetProperties(context.Background(), &blob.GetPropertiesOptions{
-			CPKInfo: bb.blobCPKOpt,
+			CPKInfo: copyCPK,
 		})
 		if err != nil {
 			log.Err("BlockBlob::RenameFile : CopyStats : Failed to get blob properties for %s [%s]", source, err.Error())
@@ -441,6 +570,12 @@ func (bb *BlockBlob) RenameFile(source string, target string, srcAttr *internal.
 
 	log.Trace("BlockBlob::RenameFile : %s -> %s done", source, target)
 
+	// Move any open-version pin and migration record to the destination before
+	// the source delete notification removes the source entry.
+	if m := bb.Config.cpk; m != nil && m.Enabled() {
+		m.NotifyRenamed(source, target)
+	}
+
 	// Copy of the file is done so now delete the older file
 	err = bb.DeleteFile(source)
 	for retry := 0; retry < 3 && err == syscall.ENOENT; retry++ {
@@ -456,6 +591,17 @@ func (bb *BlockBlob) RenameFile(source string, target string, srcAttr *internal.
 		// Even after 3 retries, 1 second apart if server returns 404 then source file no longer
 		// exists on the backend and its safe to assume rename was successful
 		err = nil
+	}
+
+	if err == nil {
+		// The copy/write-back response is not proof of the destination key:
+		// reconfirm the encryption identifier (and version) from the service so
+		// the object is never tracked with a mixed/assumed key.
+		if m := bb.Config.cpk; m != nil && m.Enabled() {
+			if sha, etag, ierr := bb.remoteIdentity(target); ierr == nil {
+				m.RecordRemoteIdentity(target, sha, etag)
+			}
+		}
 	}
 
 	return err
@@ -489,8 +635,13 @@ func (bb *BlockBlob) RenameDirectory(source string, target string) error {
 
 	// To rename source marker blob check its properties before calling rename on it.
 	blobClient := bb.Container.NewBlockBlobClient(filepath.Join(bb.Config.prefixPath, source))
+	markerCPK, cpkErr := bb.readCPKInfo(source)
+	if cpkErr != nil {
+		log.Err("BlockBlob::RenameDirectory : Failed to select key for marker %s [%s]", source, cpkErr.Error())
+		return cpkErr
+	}
 	_, err := blobClient.GetProperties(context.Background(), &blob.GetPropertiesOptions{
-		CPKInfo: bb.blobCPKOpt,
+		CPKInfo: markerCPK,
 	})
 	if err != nil {
 		serr := storeBlobErrToErr(err)
@@ -510,11 +661,24 @@ func (bb *BlockBlob) RenameDirectory(source string, target string) error {
 }
 
 func (bb *BlockBlob) getAttrUsingRest(name string) (attr *internal.ObjAttr, err error) {
+	return bb.getAttrWithCPK(name, "")
+}
+
+// getAttrWithCPK fetches blob properties presenting the correct customer
+// provided key. forcedSHA is the encryption identifier observed on a list
+// response for this object; when empty the identity is resolved from the key
+// ring (remote list when necessary).
+func (bb *BlockBlob) getAttrWithCPK(name, forcedSHA string) (attr *internal.ObjAttr, err error) {
 	log.Trace("BlockBlob::getAttrUsingRest : name %s", name)
+
+	cpkOpt, remoteSHA, err := bb.resolveAttrCPK(name, forcedSHA)
+	if err != nil {
+		return attr, err
+	}
 
 	blobClient := bb.Container.NewBlockBlobClient(filepath.Join(bb.Config.prefixPath, name))
 	prop, err := blobClient.GetProperties(context.Background(), &blob.GetPropertiesOptions{
-		CPKInfo: bb.blobCPKOpt,
+		CPKInfo: cpkOpt,
 	})
 
 	if err != nil {
@@ -551,10 +715,53 @@ func (bb *BlockBlob) getAttrUsingRest(name string) (attr *internal.ObjAttr, err 
 
 	parseMetadata(attr, prop.Metadata)
 
+	// Carry the remote key identity so upstream caches associate the attribute
+	// with the exact key version and so the key ring can select per object.
+	if m := bb.Config.cpk; m != nil && m.Enabled() {
+		attr.EncryptionKeySHA = remoteSHA
+		m.RecordRemoteIdentity(name, remoteSHA, attr.ETag)
+	}
+
 	// We do not get permissions as part of this getAttr call hence setting the flag to true
 	attr.Flags.Set(internal.PropFlagModeDefault)
 
 	return attr, nil
+}
+
+// resolveAttrCPK picks the key for a GetProperties call and returns the remote
+// key sha (empty for non-CPK objects) to stamp on the attribute.
+func (bb *BlockBlob) resolveAttrCPK(name, forcedSHA string) (*blob.CPKInfo, string, error) {
+	m := bb.Config.cpk
+	if m == nil || !m.Enabled() {
+		return bb.blobCPKOpt, "", nil
+	}
+
+	if forcedSHA != "" {
+		opt, err := bb.cpkInfoForSHA(forcedSHA)
+		if err != nil {
+			return nil, "", err
+		}
+		return opt, forcedSHA, nil
+	}
+
+	// Single-key mounts keep the legacy unconditional behaviour.
+	if m.SingleKeyMode() {
+		return bb.blobCPKOpt, "", nil
+	}
+
+	sha, _, err := m.resolveIdentity(name)
+	if err != nil {
+		return nil, "", mapCPKSelectionErr(err)
+	}
+	if sha == "" {
+		// Not a CPK blob: presenting the active key preserves legacy behaviour.
+		return m.BlobCPKInfo(m.ActiveSHA()), "", nil
+	}
+	k, err := m.KeyForSHA(sha)
+	if err != nil {
+		return nil, "", mapCPKSelectionErr(err)
+	}
+	return m.BlobCPKInfo(k.material.sha), sha, nil
 }
 
 func (bb *BlockBlob) getAttrUsingList(name string) (attr *internal.ObjAttr, err error) {
@@ -790,9 +997,13 @@ func (bb *BlockBlob) processBlobItems(blobItems []*container.BlobItem) ([]*inter
 }
 
 func (bb *BlockBlob) getBlobAttr(blobInfo *container.BlobItem) (*internal.ObjAttr, error) {
+	name := removePrefixPath(bb.Config.prefixPath, *blobInfo.Name)
 	if blobInfo.Properties.CustomerProvidedKeySHA256 != nil && *blobInfo.Properties.CustomerProvidedKeySHA256 != "" {
-		log.Trace("BlockBlob::List : blob is encrypted with customer provided key so fetching metadata explicitly using REST")
-		return bb.getAttrUsingRest(removePrefixPath(bb.Config.prefixPath, *blobInfo.Name))
+		cpkSHA := *blobInfo.Properties.CustomerProvidedKeySHA256
+		log.Trace("BlockBlob::List : blob %s is encrypted with customer provided key %s, fetching metadata with matching key", name, cpkSHA)
+		// Select the key strictly from the remote encryption identifier so a
+		// cached/static key can never be presented for an object on another key.
+		return bb.getAttrWithCPK(name, cpkSHA)
 	}
 	mode, err := bb.getFileMode(blobInfo.Properties.Permissions)
 	if err != nil {
@@ -801,7 +1012,7 @@ func (bb *BlockBlob) getBlobAttr(blobInfo *container.BlobItem) (*internal.ObjAtt
 	}
 
 	attr := &internal.ObjAttr{
-		Path:   removePrefixPath(bb.Config.prefixPath, *blobInfo.Name),
+		Path:   name,
 		Name:   filepath.Base(*blobInfo.Name),
 		Size:   *blobInfo.Properties.ContentLength,
 		Mode:   mode,
@@ -941,6 +1152,11 @@ func (bb *BlockBlob) ReadToFile(name string, offset int64, count int64, fi *os.F
 	log.Trace("BlockBlob::ReadToFile : name %s, offset : %d, count %d", name, offset, count)
 	//defer exectime.StatTimeCurrentBlock("BlockBlob::ReadToFile")()
 
+	cpkOpt, err := bb.readCPKInfo(name)
+	if err != nil {
+		return err
+	}
+
 	blobClient := bb.Container.NewBlobClient(filepath.Join(bb.Config.prefixPath, name))
 
 	downloadPtr := to.Ptr(int64(1))
@@ -958,6 +1174,7 @@ func (bb *BlockBlob) ReadToFile(name string, offset int64, count int64, fi *os.F
 		Offset: offset,
 		Count:  count,
 	}
+	dlOpts.CPKInfo = cpkOpt
 
 	_, err = blobClient.DownloadFile(context.Background(), fi, &dlOpts)
 
@@ -984,7 +1201,7 @@ func (bb *BlockBlob) ReadToFile(name string, offset int64, count int64, fi *os.F
 		} else {
 			// Get latest properties from container to get the md5 of blob
 			prop, err := blobClient.GetProperties(context.Background(), &blob.GetPropertiesOptions{
-				CPKInfo: bb.blobCPKOpt,
+				CPKInfo: cpkOpt,
 			})
 			if err != nil {
 				log.Warn("BlockBlob::ReadToFile : Failed to get properties of blob %s [%s]", name, err.Error())
@@ -1018,6 +1235,11 @@ func (bb *BlockBlob) ReadBuffer(name string, offset int64, length int64) ([]byte
 		length = attr.Size - offset
 	}
 
+	cpkOpt, err := bb.readCPKInfo(name)
+	if err != nil {
+		return buff, err
+	}
+
 	buff = make([]byte, length)
 	blobClient := bb.Container.NewBlobClient(filepath.Join(bb.Config.prefixPath, name))
 
@@ -1026,8 +1248,9 @@ func (bb *BlockBlob) ReadBuffer(name string, offset int64, length int64) ([]byte
 		Offset: offset,
 		Count:  length,
 	}
+	dlOpts.CPKInfo = cpkOpt
 
-	_, err := blobClient.DownloadBuffer(context.Background(), buff, &dlOpts)
+	_, err = blobClient.DownloadBuffer(context.Background(), buff, &dlOpts)
 
 	if err != nil {
 		e := storeBlobErrToErr(err)
@@ -1053,6 +1276,11 @@ func (bb *BlockBlob) ReadInBuffer(name string, offset int64, length int64, data 
 		*etag = ""
 	}
 
+	cpkOpt, err := bb.readCPKInfo(name)
+	if err != nil {
+		return err
+	}
+
 	blobClient := bb.Container.NewBlobClient(filepath.Join(bb.Config.prefixPath, name))
 
 	ctx, cancel := context.WithTimeout(context.Background(), max_context_timeout*time.Minute)
@@ -1063,7 +1291,7 @@ func (bb *BlockBlob) ReadInBuffer(name string, offset int64, length int64, data 
 			Offset: offset,
 			Count:  length,
 		},
-		CPKInfo: bb.blobCPKOpt,
+		CPKInfo: cpkOpt,
 	}
 
 	downloadResponse, err := blobClient.DownloadStream(ctx, opt)
@@ -1161,6 +1389,19 @@ func (bb *BlockBlob) WriteFromFile(name string, metadata map[string]*string, fi 
 	log.Trace("BlockBlob::WriteFromFile : name %s", name)
 	//defer exectime.StatTimeCurrentBlock("WriteFromFile::WriteFromFile")()
 
+	keyVer, err := bb.writeKeyVersion(name)
+	if err != nil {
+		return err
+	}
+	var cpkOpt *blob.CPKInfo
+	cpkSHA := ""
+	if keyVer != nil {
+		cpkOpt = bb.Config.cpk.BlobCPKInfo(keyVer.material.sha)
+		cpkSHA = keyVer.material.sha
+	} else {
+		cpkOpt = bb.blobCPKOpt
+	}
+
 	blobClient := bb.Container.NewBlockBlobClient(filepath.Join(bb.Config.prefixPath, name))
 	defer log.TimeTrack(time.Now(), "BlockBlob::WriteFromFile", name)
 
@@ -1205,7 +1446,7 @@ func (bb *BlockBlob) WriteFromFile(name string, metadata map[string]*string, fi 
 			BlobContentType: to.Ptr(getContentType(name)),
 			BlobContentMD5:  md5sum,
 		},
-		CPKInfo: bb.blobCPKOpt,
+		CPKInfo: cpkOpt,
 	}
 	if common.MonitorBfs() && stat.Size() > 0 {
 		uploadOptions.Progress = func(bytesTransferred int64) {
@@ -1213,7 +1454,7 @@ func (bb *BlockBlob) WriteFromFile(name string, metadata map[string]*string, fi 
 		}
 	}
 
-	_, err = blobClient.UploadFile(context.Background(), fi, uploadOptions)
+	uploadResp, err := blobClient.UploadFile(context.Background(), fi, uploadOptions)
 
 	if err != nil {
 		serr := storeBlobErrToErr(err)
@@ -1237,16 +1478,23 @@ func (bb *BlockBlob) WriteFromFile(name string, metadata map[string]*string, fi 
 		}
 	}
 
+	if cpkSHA != "" {
+		bb.Config.cpk.RecordPublish(name, cpkSHA, sanitizeEtag(uploadResp.ETag))
+	}
 	return nil
 }
 
 // WriteFromBuffer : Upload from a buffer to a blob
 func (bb *BlockBlob) WriteFromBuffer(name string, metadata map[string]*string, data []byte) error {
-	_, err := bb.uploadBuffer(name, metadata, data, nil)
+	cpkOpt, err := bb.writeCPKInfo(name)
+	if err != nil {
+		return err
+	}
+	_, err = bb.uploadBuffer(name, metadata, data, nil, cpkOpt)
 	return err
 }
 
-func (bb *BlockBlob) uploadBuffer(name string, metadata map[string]*string, data []byte, conditions *blob.AccessConditions) (*azcore.ETag, error) {
+func (bb *BlockBlob) uploadBuffer(name string, metadata map[string]*string, data []byte, conditions *blob.AccessConditions, cpkOpt *blob.CPKInfo) (*azcore.ETag, error) {
 	log.Trace("BlockBlob::uploadBuffer : name %s", name)
 	blobClient := bb.Container.NewBlockBlobClient(filepath.Join(bb.Config.prefixPath, name))
 
@@ -1261,12 +1509,16 @@ func (bb *BlockBlob) uploadBuffer(name string, metadata map[string]*string, data
 		HTTPHeaders: &blob.HTTPHeaders{
 			BlobContentType: to.Ptr(getContentType(name)),
 		},
-		CPKInfo: bb.blobCPKOpt,
+		CPKInfo: cpkOpt,
 	})
 
 	if err != nil {
 		log.Err("BlockBlob::uploadBuffer : Failed to upload blob %s [%s]", name, err.Error())
 		return nil, err
+	}
+
+	if m := bb.Config.cpk; m != nil && m.Enabled() && cpkOpt != nil && cpkOpt.EncryptionKeySHA256 != nil {
+		m.RecordPublish(name, *cpkOpt.EncryptionKeySHA256, sanitizeEtag(resp.ETag))
 	}
 
 	return resp.ETag, nil
@@ -1723,6 +1975,10 @@ func (bb *BlockBlob) Write(options *internal.WriteFileOptions) error {
 
 // TODO: make a similar method facing stream that would enable us to write to cached blocks then stage and commit
 func (bb *BlockBlob) stageAndCommitModifiedBlocks(name string, data []byte, offsetList *common.BlockOffsetList) error {
+	cpkOpt, err := bb.writeCPKInfo(name)
+	if err != nil {
+		return err
+	}
 	blobClient := bb.Container.NewBlockBlobClient(filepath.Join(bb.Config.prefixPath, name))
 	blockOffset := int64(0)
 	var blockIDList []string
@@ -1733,7 +1989,7 @@ func (bb *BlockBlob) stageAndCommitModifiedBlocks(name string, data []byte, offs
 				blk.Id,
 				streaming.NopCloser(bytes.NewReader(data[blockOffset:(blk.EndIndex-blk.StartIndex)+blockOffset])),
 				&blockblob.StageBlockOptions{
-					CPKInfo: bb.blobCPKOpt,
+					CPKInfo: cpkOpt,
 				})
 
 			if err != nil {
@@ -1743,19 +1999,22 @@ func (bb *BlockBlob) stageAndCommitModifiedBlocks(name string, data []byte, offs
 			blockOffset = (blk.EndIndex - blk.StartIndex) + blockOffset
 		}
 	}
-	_, err := blobClient.CommitBlockList(context.Background(),
+	resp, err := blobClient.CommitBlockList(context.Background(),
 		blockIDList,
 		&blockblob.CommitBlockListOptions{
 			HTTPHeaders: &blob.HTTPHeaders{
 				BlobContentType: to.Ptr(getContentType(name)),
 			},
 			Tier:    bb.Config.defaultTier,
-			CPKInfo: bb.blobCPKOpt,
+			CPKInfo: cpkOpt,
 		})
 
 	if err != nil {
 		log.Err("BlockBlob::stageAndCommitModifiedBlocks : Failed to commit block list to blob %s [%s]", name, err.Error())
 		return err
+	}
+	if m := bb.Config.cpk; m != nil && m.Enabled() && cpkOpt != nil && cpkOpt.EncryptionKeySHA256 != nil {
+		m.RecordPublish(name, *cpkOpt.EncryptionKeySHA256, sanitizeEtag(resp.ETag))
 	}
 	return nil
 }
@@ -1765,6 +2024,14 @@ func (bb *BlockBlob) StageAndCommit(name string, bol *common.BlockOffsetList) er
 	blobMtx := bb.blockLocks.GetLock(name)
 	blobMtx.Lock()
 	defer blobMtx.Unlock()
+
+	// All blocks of one block blob must be encrypted with the same customer
+	// provided key: publish this version under the object's current key
+	// identity (or the key its open version was pinned to).
+	cpkOpt, err := bb.writeCPKInfo(name)
+	if err != nil {
+		return err
+	}
 
 	blobClient := bb.Container.NewBlockBlobClient(filepath.Join(bb.Config.prefixPath, name))
 	var blockIDList []string
@@ -1801,7 +2068,7 @@ func (bb *BlockBlob) StageAndCommit(name string, bol *common.BlockOffsetList) er
 				blk.Id,
 				streaming.NopCloser(bytes.NewReader(data)),
 				&blockblob.StageBlockOptions{
-					CPKInfo: bb.blobCPKOpt,
+					CPKInfo: cpkOpt,
 				})
 			if err != nil {
 				log.Err("BlockBlob::StageAndCommit : Failed to stage to blob %s with ID %s at block %v [%s]", name, blk.Id, blk.StartIndex, err.Error())
@@ -1813,19 +2080,22 @@ func (bb *BlockBlob) StageAndCommit(name string, bol *common.BlockOffsetList) er
 	}
 
 	if staged {
-		_, err := blobClient.CommitBlockList(context.Background(),
+		resp, err := blobClient.CommitBlockList(context.Background(),
 			blockIDList,
 			&blockblob.CommitBlockListOptions{
 				HTTPHeaders: &blob.HTTPHeaders{
 					BlobContentType: to.Ptr(getContentType(name)),
 				},
 				Tier:    bb.Config.defaultTier,
-				CPKInfo: bb.blobCPKOpt,
+				CPKInfo: cpkOpt,
 				// AccessConditions: &blob.AccessConditions{ModifiedAccessConditions: &blob.ModifiedAccessConditions{IfMatch: bol.Etag}},
 			})
 		if err != nil {
 			log.Err("BlockBlob::StageAndCommit : Failed to commit block list to blob %s [%s]", name, err.Error())
 			return err
+		}
+		if m := bb.Config.cpk; m != nil && m.Enabled() && cpkOpt != nil && cpkOpt.EncryptionKeySHA256 != nil {
+			m.RecordPublish(name, *cpkOpt.EncryptionKeySHA256, sanitizeEtag(resp.ETag))
 		}
 		// update the etag
 		// bol.Etag = resp.ETag()
@@ -1896,15 +2166,20 @@ func (bb *BlockBlob) GetCommittedBlockList(name string) (*internal.CommittedBloc
 func (bb *BlockBlob) StageBlock(name string, data []byte, id string) error {
 	log.Trace("BlockBlob::StageBlock : name %s, ID %v, length %v", name, id, len(data))
 
+	cpkOpt, err := bb.writeCPKInfo(name)
+	if err != nil {
+		return err
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), max_context_timeout*time.Minute)
 	defer cancel()
 
 	blobClient := bb.Container.NewBlockBlobClient(filepath.Join(bb.Config.prefixPath, name))
-	_, err := blobClient.StageBlock(ctx,
+	_, err = blobClient.StageBlock(ctx,
 		id,
 		streaming.NopCloser(bytes.NewReader(data)),
 		&blockblob.StageBlockOptions{
-			CPKInfo: bb.blobCPKOpt,
+			CPKInfo: cpkOpt,
 		})
 
 	if err != nil {
@@ -1919,6 +2194,11 @@ func (bb *BlockBlob) StageBlock(name string, data []byte, id string) error {
 func (bb *BlockBlob) CommitBlocks(name string, blockList []string, newEtag *string) error {
 	log.Trace("BlockBlob::CommitBlocks : name %s", name)
 
+	cpkOpt, err := bb.writeCPKInfo(name)
+	if err != nil {
+		return err
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), max_context_timeout*time.Minute)
 	defer cancel()
 
@@ -1930,7 +2210,7 @@ func (bb *BlockBlob) CommitBlocks(name string, blockList []string, newEtag *stri
 				BlobContentType: to.Ptr(getContentType(name)),
 			},
 			Tier:    bb.Config.defaultTier,
-			CPKInfo: bb.blobCPKOpt,
+			CPKInfo: cpkOpt,
 		})
 
 	if err != nil {
@@ -1940,6 +2220,10 @@ func (bb *BlockBlob) CommitBlocks(name string, blockList []string, newEtag *stri
 
 	if newEtag != nil {
 		*newEtag = sanitizeEtag(resp.ETag)
+	}
+
+	if m := bb.Config.cpk; m != nil && m.Enabled() && cpkOpt != nil && cpkOpt.EncryptionKeySHA256 != nil {
+		m.RecordPublish(name, *cpkOpt.EncryptionKeySHA256, sanitizeEtag(resp.ETag))
 	}
 
 	return nil
